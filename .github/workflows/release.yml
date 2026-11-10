@@ -1,0 +1,379 @@
+name: Build and Release
+
+# Runs on every push to main. The version-bump commit uses [skip ci] so it
+# doesn't re-trigger the workflow.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  release:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    env:
+      SCHEME: Image-Filter_Service
+      XCODE_PROJECT: Image-Filter_Service.xcodeproj
+      TEAM_ID: J97QDPV6YC
+      BUNDLE_ID: FelzyTech.Image-Filter-Service
+      # Path to the extension entitlements file (used when re-signing after bundle injection)
+      ENTITLEMENTS_EXT: "macOS/Extension/Image-Filter_Service_Extension.entitlements"
+      MODEL_URL: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite"
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ── 2. Bump version ───────────────────────────────────────────────────────
+      - name: Bump version
+        id: ver
+        # The commit message goes in through an environment variable, never pasted into the
+        # script: a double quote in it used to end the string early (run 42534320838 failed
+        # with "Safari: command not found") and a command substitution would have run here.
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 .github/scripts/bump_version.py "$COMMIT_MESSAGE" \
+            >> "$GITHUB_OUTPUT"
+
+      # ── 3. Import signing certificate ─────────────────────────────────────────
+      - name: Set up signing
+        id: signing
+        env:
+          CERT_B64: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          if [ -z "$CERT_B64" ]; then
+            echo "::notice::No MACOS_CERTIFICATE secret — build will be ad-hoc signed (not distributable)"
+            echo "identity=" >> "$GITHUB_OUTPUT"
+            echo "keychain=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KC_PATH="$RUNNER_TEMP/build.keychain"
+          KC_PWD=$(openssl rand -hex 16)
+
+          echo "$CERT_B64" | base64 --decode > /tmp/certificate.p12
+
+          security create-keychain -p "$KC_PWD" "$KC_PATH"
+          security set-keychain-settings -lut 21600 "$KC_PATH"
+          security unlock-keychain -p "$KC_PWD" "$KC_PATH"
+          security import /tmp/certificate.p12 \
+            -k "$KC_PATH" \
+            -P "$CERT_PWD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/xcodebuild
+          security list-keychain -d user -s "$KC_PATH"
+          # Its output lists the private key's attributes, including the certificate holder's real name
+          # ("Apple Development: <name> (<name>)"), so nothing from it may reach the (public) log.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KC_PWD" "$KC_PATH" > /dev/null 2>&1 \
+            || { echo "::error::could not allow codesign to use the signing key"; exit 1; }
+          rm /tmp/certificate.p12
+
+          IDENTITY=$(security find-identity -p codesigning -v "$KC_PATH" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENTITY" ]; then
+            IDENTITY=$(security find-identity -p codesigning -v "$KC_PATH" \
+              | awk -F'"' '/Apple Development/ {print $2; exit}')
+          fi
+
+          # The identity is "Apple Development: <Apple ID email> (<certificate ID>)": personal data
+          # that must never reach the (public) logs. Register it, and each part of it, as a masked
+          # value BEFORE anything can print it. Later steps interpolate the identity into their
+          # scripts, and the runner echoes those scripts into the log, so the mask also covers them.
+          if [ -n "$IDENTITY" ]; then
+            echo "::add-mask::$IDENTITY"
+            DETAIL="${IDENTITY#*: }"                                    # "<email> (<id>)"
+            NAME_PART="${DETAIL% (*}"                                   # "<email>"
+            CERT_ID=$(printf '%s' "$DETAIL" | sed -nE 's/.*\(([A-Za-z0-9]+)\)$/\1/p')
+            [ -n "$NAME_PART" ] && echo "::add-mask::$NAME_PART"
+            [ -n "$CERT_ID" ]   && echo "::add-mask::$CERT_ID"
+          fi
+
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "keychain=$KC_PATH" >> "$GITHUB_OUTPUT"
+          case "$IDENTITY" in
+            "")                          echo "::warning::No code-signing identity found in the certificate - build will be ad-hoc signed" ;;
+            "Developer ID Application"*) echo "::notice::Signing with a Developer ID Application certificate (name hidden)" ;;
+            *)                           echo "::notice::Signing with an Apple Development certificate (name hidden)" ;;
+          esac
+
+      # ── 4. Archive ────────────────────────────────────────────────────────────
+      - name: Archive
+        run: |
+          IDENTITY="${{ steps.signing.outputs.identity }}"
+          CODE_SIGN_ID="${IDENTITY:--}"
+
+          xcodebuild archive \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$CODE_SIGN_ID" \
+            ONLY_ACTIVE_ARCH=NO \
+            | grep -E "(error:|warning:|Build succeeded|Build failed)" || true
+
+      # ── 5. Export .app ────────────────────────────────────────────────────────
+      - name: Export
+        run: |
+          IDENTITY="${{ steps.signing.outputs.identity }}"
+
+          if [[ "$IDENTITY" == *"Developer ID Application"* ]]; then
+            # Paid Developer ID cert — full distribution export
+            cat > "$RUNNER_TEMP/ExportOptions.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>developer-id</string>
+            <key>teamID</key>
+            <string>${TEAM_ID}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+          </dict>
+          </plist>
+          EOF
+            xcodebuild -exportArchive \
+              -archivePath "$RUNNER_TEMP/app.xcarchive" \
+              -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+              -exportPath "$RUNNER_TEMP/export"
+          else
+            # Apple Development cert (free) or ad-hoc — extract directly from archive.
+            mkdir -p "$RUNNER_TEMP/export"
+            find "$RUNNER_TEMP/app.xcarchive/Products/Applications" \
+              -maxdepth 1 -name "*.app" -exec cp -r {} "$RUNNER_TEMP/export/" \;
+          fi
+
+      # ── 6. Download MediaPipe model ───────────────────────────────────────────
+      - name: Download model
+        run: |
+          mkdir -p server/models
+          echo "Downloading MediaPipe segmentation model…"
+          curl -fsSL "$MODEL_URL" -o server/models/selfie_multiclass_256x256.tflite
+          echo "  $(du -h server/models/selfie_multiclass_256x256.tflite | awk '{print $1}')  model downloaded"
+
+      # ── 7. Inject Python server into .app bundle ──────────────────────────────
+      - name: Inject server into bundle
+        run: |
+          APP_PATH=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name "*.app" | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app found in $RUNNER_TEMP/export/"
+            exit 1
+          fi
+          RESOURCES="$APP_PATH/Contents/Resources"
+
+          echo "Bundling Python server into $APP_PATH"
+          cp -r server/          "$RESOURCES/server/"   # includes start_server.py
+          cp    server/requirements.txt "$RESOURCES/requirements.txt"
+
+          # Strip compiled bytecode and runtime-only files that shouldn't ship.
+          find "$RESOURCES/server" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+          find "$RESOURCES/server" -name "*.pyc"       -delete 2>/dev/null || true
+          find "$RESOURCES/server" -name "*.log"       -delete 2>/dev/null || true
+          find "$RESOURCES/server" -name "*.pid"       -delete 2>/dev/null || true
+
+          echo "  Server bundle contents:"
+          ls -lh "$RESOURCES/server/"
+
+      # ── 8. Re-sign after bundle injection ─────────────────────────────────────
+      # Adding files to Contents/Resources after signing breaks the code signature.
+      # This step re-signs the extension (with its entitlements) and then the outer
+      # .app to produce a valid, Gatekeeper-accepted bundle.
+      - name: Re-sign bundle
+        run: |
+          IDENTITY="${{ steps.signing.outputs.identity }}"
+          CODE_SIGN_ID="${IDENTITY:--}"
+          APP_PATH=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name "*.app" | head -1)
+          EXT_PATH="$APP_PATH/Contents/PlugIns/Image-Filter_Service Extension.appex"
+
+          # Never echo the identity itself: it contains the Apple ID email (see "Set up signing").
+          if [ "$CODE_SIGN_ID" = "-" ]; then echo "Re-signing bundle (ad-hoc)"; else echo "Re-signing bundle"; fi
+
+          # --options runtime enables the Hardened Runtime required for notarization.
+          # Only applicable for real (non-ad-hoc) certificates.
+          RUNTIME_OPT=""
+          [ "$CODE_SIGN_ID" != "-" ] && RUNTIME_OPT="--options runtime"
+
+          # 1. Sign the Safari extension with its sandbox + network.client entitlements.
+          codesign --force $RUNTIME_OPT \
+            --sign "$CODE_SIGN_ID" \
+            --entitlements "$ENTITLEMENTS_EXT" \
+            "$EXT_PATH"
+
+          # 2. Re-seal the outer .app — locks down Contents/Resources including the
+          #    newly added Python server files.
+          codesign --force $RUNTIME_OPT \
+            --sign "$CODE_SIGN_ID" \
+            "$APP_PATH"
+
+          # Verify the final signature is coherent.
+          codesign --verify --deep --strict "$APP_PATH" \
+            && echo "Signature verified ✓" \
+            || echo "::warning::Signature verification failed (expected for ad-hoc builds on macOS 26+)"
+
+      # ── 9. Build .pkg installer ───────────────────────────────────────────────
+      - name: Build .pkg
+        id: pkg
+        run: |
+          NEW_VERSION="${{ steps.ver.outputs.new_version }}"
+          APP_PATH=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name "*.app" | head -1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app found in $RUNNER_TEMP/export/"
+            exit 1
+          fi
+          echo "Packaging: $APP_PATH"
+
+          PKG_NAME="Image-Filter-Service-${NEW_VERSION}.pkg"
+          PKG_PATH="$RUNNER_TEMP/$PKG_NAME"
+
+          # Not relocatable. By default (on runners older than macOS 27) the installer looks for
+          # ANY copy of this bundle on the Mac and updates that one instead of /Applications, e.g. a
+          # leftover build folder, which leaves the real install stale. Forbid that for the app and
+          # for the extension inside it.
+          PKG_ROOT="$RUNNER_TEMP/pkgroot"
+          COMPONENT_PLIST="$RUNNER_TEMP/components.plist"
+          rm -rf "$PKG_ROOT"; mkdir -p "$PKG_ROOT"
+          ditto "$APP_PATH" "$PKG_ROOT/$(basename "$APP_PATH")"
+          pkgbuild --analyze --root "$PKG_ROOT" "$COMPONENT_PLIST" > /dev/null
+          python3 - "$COMPONENT_PLIST" <<'PY'
+          import plistlib, sys
+          path = sys.argv[1]
+          def forbid_relocation(bundles):
+              for bundle in bundles:
+                  bundle["BundleIsRelocatable"] = False
+                  forbid_relocation(bundle.get("ChildBundles", []))
+          with open(path, "rb") as f:
+              components = plistlib.load(f)
+          forbid_relocation(components)
+          with open(path, "wb") as f:
+              plistlib.dump(components, f)
+          PY
+
+          pkgbuild \
+            --root "$PKG_ROOT" \
+            --component-plist "$COMPONENT_PLIST" \
+            --install-location /Applications \
+            --identifier "$BUNDLE_ID" \
+            --version "$NEW_VERSION" \
+            --scripts ".github/scripts/pkg-scripts" \
+            "$PKG_PATH"
+
+          echo "pkg_path=$PKG_PATH"   >> "$GITHUB_OUTPUT"
+          echo "pkg_name=$PKG_NAME"   >> "$GITHUB_OUTPUT"
+          echo "  $(du -h "$PKG_PATH" | awk '{print $1}')  $PKG_NAME"
+
+      # ── 9b. Signed update files for the in-app updater ───────────────────────
+      # The installed app updates itself from this release (macOS/App/UpdateService.swift):
+      #   <app>.zip   the re-signed app, exactly as inside the .pkg
+      #   update.json an Ed25519-signed manifest: version, notes, and the zip's size + SHA-256
+      # This runs BEFORE the tag is pushed, so anything wrong here (secret not matching the public key
+      # compiled into the app, an app whose code signature the client would refuse) stops the release
+      # instead of publishing updates that no Mac would accept.
+      - name: Build signed update files
+        id: update
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          SIGNED: ${{ steps.signing.outputs.identity != '' }}
+          NEW_VERSION: ${{ steps.ver.outputs.new_version }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::warning::UPDATE_SIGNING_KEY is not set - this release has no in-app update files"
+            exit 0
+          fi
+          if [ "$SIGNED" != "true" ]; then
+            echo "::warning::The app is ad-hoc signed, so no Mac would accept it as an update - no in-app update files"
+            exit 0
+          fi
+
+          APP_PATH=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name "*.app" | head -1)
+          ZIP="$RUNNER_TEMP/Image-Filter-Service-${NEW_VERSION}.zip"
+          MANIFEST="$RUNNER_TEMP/update.json"
+          printf '%s' "$COMMIT_MESSAGE" | grep -v '\[skip ci\]' > "$RUNNER_TEMP/update_notes.md" || true
+
+          # ditto keeps the code signature intact (a plain zip would not).
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP"
+
+          swiftc -O -o "$RUNNER_TEMP/sign_update" scripts/update/sign_update.swift
+          "$RUNNER_TEMP/sign_update" sign --version "$NEW_VERSION" --asset "$ZIP" \
+            --notes-file "$RUNNER_TEMP/update_notes.md" --out "$MANIFEST"
+
+          # 1. The signature must verify against the PUBLIC key compiled into the app.
+          PUBLIC_KEY=$(sed -nE 's/.*publicKeyBase64 = "([^"]+)".*/\1/p' macOS/App/UpdateConfig.swift)
+          [ -n "$PUBLIC_KEY" ] || { echo "::error::public key not found in UpdateConfig.swift"; exit 1; }
+          "$RUNNER_TEMP/sign_update" verify "$MANIFEST" --public-key "$PUBLIC_KEY" --asset "$ZIP" \
+            || { echo "::error::UPDATE_SIGNING_KEY does not match UpdateConfig.publicKeyBase64"; exit 1; }
+
+          # 2. The zip must unpack to an app that meets the exact signing requirement the updater enforces.
+          rm -rf "$RUNNER_TEMP/zipcheck"; mkdir "$RUNNER_TEMP/zipcheck"
+          ditto -x -k "$ZIP" "$RUNNER_TEMP/zipcheck"
+          CHECKED="$RUNNER_TEMP/zipcheck/$(basename "$APP_PATH")"
+          APP_REQ="anchor apple generic and identifier \"$BUNDLE_ID\" and certificate leaf[subject.OU] = \"$TEAM_ID\""
+          EXT_REQ="anchor apple generic and identifier \"$BUNDLE_ID.Extension\" and certificate leaf[subject.OU] = \"$TEAM_ID\""
+          codesign --verify --deep --strict -R="$APP_REQ" "$CHECKED" \
+            || { echo "::error::the unpacked app does not meet the updater's signing requirement"; exit 1; }
+          codesign --verify --strict -R="$EXT_REQ" "$CHECKED/Contents/PlugIns/Image-Filter_Service Extension.appex" \
+            || { echo "::error::the unpacked extension does not meet the updater's signing requirement"; exit 1; }
+
+          {
+            echo "files<<UPDATE_FILES_EOF"
+            echo "$ZIP"
+            echo "$MANIFEST"
+            echo "UPDATE_FILES_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Update files ready: $(du -h "$ZIP" | awk '{print $1}')  $(basename "$ZIP")  +  update.json"
+
+      # ── 10. Commit version bump & tag ────────────────────────────────────────
+      - name: Commit & tag
+        run: |
+          NEW_VERSION="${{ steps.ver.outputs.new_version }}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add "$XCODE_PROJECT/project.pbxproj" \
+                  "Shared/Extension/manifest.json"
+          git commit -m "chore: bump version to ${NEW_VERSION} [skip ci]"
+          git tag "v${NEW_VERSION}"
+          git push origin main "v${NEW_VERSION}"
+
+      # ── 11. Create GitHub Release ─────────────────────────────────────────────
+      - name: Write release notes
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          printf '%s' "$COMMIT_MESSAGE" \
+            | grep -v '\[skip ci\]' \
+            > "$RUNNER_TEMP/release_notes.md"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.new_version }}
+          name: "Image Filter Service v${{ steps.ver.outputs.new_version }}"
+          body_path: ${{ runner.temp }}/release_notes.md
+          files: |
+            ${{ steps.pkg.outputs.pkg_path }}
+            ${{ steps.update.outputs.files }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 12. Cleanup ───────────────────────────────────────────────────────────
+      - name: Delete keychain
+        if: always() && steps.signing.outputs.keychain != ''
+        run: security delete-keychain "${{ steps.signing.outputs.keychain }}" 2>/dev/null || true

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for Image Filter Service.
+
+  This runs a lightweight background WATCHER (accessory mode, no Dock icon,
+  ~0% CPU idle). The watcher subscribes to NSWorkspace notifications and:
+    • starts the heavy server (gunicorn + MediaPipe) when Safari launches
+    • stops that server when Safari quits
+  So the resource-heavy server only runs while Safari is open, but the watcher
+  is always alive to catch every Safari launch reliably.
+
+  RunAtLoad   — start the watcher at login.
+  KeepAlive   — relaunch the watcher immediately if it ever crashes/quits, so
+                the "start server when Safari opens" guarantee never lapses.
+
+  The .pkg installer writes and loads this file automatically.
+  For manual installation after copying the .app to /Applications:
+
+    cp macOS/com.imagefilter.server.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.imagefilter.server.plist
+
+  To stop and remove:
+
+    launchctl unload ~/Library/LaunchAgents/com.imagefilter.server.plist
+    rm ~/Library/LaunchAgents/com.imagefilter.server.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.imagefilter.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Image-Filter_Service.app/Contents/MacOS/Image-Filter_Service</string>
+        <string>--start-server-only</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/Image-Filter-Service/host.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/Image-Filter-Service/host_error.log</string>
+</dict>
+</plist>

@@ -1,0 +1,928 @@
+/* Image Filter Service - popup
+   One status card, this website's switch, and two list rows that open their own screens.
+   Sizes live in variables so the iPhone/iPad sheet (bottom of the file) only overrides them. */
+
+:root {
+    color-scheme: light dark;
+
+    --bg: #f2f2f7;
+    --surface: #ffffff;
+    --surface-press: #ebebf0;
+    --text: #1c1c1e;
+    --muted: #6a6a70;
+    --line: rgba(60, 60, 67, 0.14);
+
+    --accent: #0a62d8;
+    --accent-soft: rgba(10, 98, 216, 0.1);
+    --btn: #0a68e8;           /* primary button fill: white text stays >= 4.5:1 */
+    --danger: #d1281e;
+    --warn: #8a4b00;
+    --warn-soft: rgba(255, 149, 0, 0.18);
+
+    --track-off: rgba(120, 120, 128, 0.32);
+    --track-on: #2e9e4f;
+
+    /* The status card is one solid colour per state; white text on each is >= 5:1. */
+    --hero-on: #15803d;
+    --hero-error: #c62828;
+    --hero-off: #a85a00;
+    --hero-checking: #596070;
+
+    --font-size: 13px;
+    --radius: 14px;
+    --row-height: 52px;
+    --control-height: 40px;
+    --switch-width: 46px;
+    --switch-height: 28px;
+    --width: 340px;
+    --screen-height: 420px;   /* every screen is this tall, so the popover never resizes */
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #1c1c1e;
+        --surface: #2c2c2e;
+        --surface-press: #3a3a3c;
+        --text: #f5f5f7;
+        --muted: #a1a1a8;
+        --line: rgba(255, 255, 255, 0.12);
+
+        --accent: #5eadff;
+        --accent-soft: rgba(94, 173, 255, 0.16);
+        --btn: #1a6fe0;
+        --danger: #ff6b61;
+        --warn: #ffb340;
+        --warn-soft: rgba(255, 159, 10, 0.2);
+
+        --track-off: rgba(120, 120, 128, 0.4);
+        --track-on: #32b25a;
+
+        --hero-on: #14693a;
+        --hero-error: #b3261e;
+        --hero-off: #94500a;
+        --hero-checking: #4b5160;
+        --shadow: none;
+    }
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    width: var(--width);
+    background: var(--bg);
+    color: var(--text);
+    font: var(--font-size) / 1.4 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -webkit-text-size-adjust: 100%;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+h1, h2, p, dl, dd, ul {
+    margin: 0;
+    padding: 0;
+}
+
+button, input {
+    font: inherit;
+    color: inherit;
+}
+
+svg {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.9;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+/* Focus rings are for keyboard use. Safari puts focus on the first control when the popup
+   opens, and a ring there looks like a stray outline on a row nobody touched, so popup.js
+   adds `keyboard` to <body> on the first key press. (Text fields have their own focus
+   style below and always show it.) */
+body.keyboard :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* Screen headings take focus from script (so a screen reader starts at the top), never from
+   the keyboard, and must not show a ring. Written to out-rank `body.keyboard :focus-visible`. */
+[tabindex="-1"]:focus,
+body.keyboard [tabindex="-1"]:focus-visible {
+    outline: none;
+}
+
+/* ---------- Screens ---------- */
+
+/* One fixed size for all screens: the popover resizing while a screen changes (or a prompt
+   opens) is what made the transitions jump. Long lists scroll inside .screen-body. */
+.screen {
+    display: flex;
+    flex-direction: column;
+    height: var(--screen-height);
+}
+
+/* The slide between screens. Only transform and opacity move, so it runs on the compositor
+   without re-laying-out anything. will-change (and backface-visibility, which keeps Safari
+   from re-rasterising the text when the layer appears and disappears) are set only while
+   the animation runs: popup.js removes the class when it ends. Forward comes in from the
+   right, back from the left. */
+.screen.slide-forward,
+.screen.slide-back {
+    will-change: transform, opacity;
+    backface-visibility: hidden;
+    animation-duration: 0.18s;
+    animation-timing-function: cubic-bezier(0.22, 0.8, 0.3, 1);
+    animation-fill-mode: both;
+}
+
+.screen.slide-forward { animation-name: slide-from-right; }
+.screen.slide-back    { animation-name: slide-from-left; }
+
+@keyframes slide-from-right {
+    from { opacity: 0; transform: translate3d(12px, 0, 0); }
+    to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+@keyframes slide-from-left {
+    from { opacity: 0; transform: translate3d(-12px, 0, 0); }
+    to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+
+@keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+/* Until the first answers arrive (popup.js removes `loading`, after 0.5 s at most) the
+   header shows and the body is blank, rather than flashing "Checking…", "None" and "No
+   website open" for a moment and then swapping them. The animation is a safety net: if
+   the script never runs, the body appears after a second anyway. */
+body.loading #screen-main .screen-body {
+    visibility: hidden;
+    animation: reveal 0s 1s forwards;
+}
+
+@keyframes reveal {
+    to { visibility: visible; }
+}
+
+/* The one-off fade when the first data arrives (popup.js adds `reveal`, then removes it, so it
+   doesn't replay on top of the slide each time the main screen is shown again). */
+.screen-body.reveal {
+    animation: fade-in 0.12s ease-out;
+}
+
+.screen-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 4px 14px 16px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
+.app-header,
+.sub-header {
+    flex: none;
+    display: grid;
+    align-items: center;
+    min-height: 46px;
+    padding: 0 14px;
+}
+
+.app-header {
+    grid-template-columns: 1fr auto;
+}
+
+.sub-header {
+    grid-template-columns: 1fr auto 1fr;
+    padding-left: 8px;
+}
+
+h1 {
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+}
+
+.version {
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.back {
+    display: inline-flex;
+    align-items: center;
+    justify-self: start;
+    gap: 1px;
+    min-height: 34px;
+    padding: 0 8px 0 2px;
+    border: 0;
+    border-radius: 8px;
+    background: none;
+    color: var(--accent);
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.back svg {
+    width: 20px;
+    height: 20px;
+}
+
+.back:active {
+    opacity: 0.6;
+}
+
+/* ---------- Status card ---------- */
+
+.hero {
+    --hero-bg: var(--hero-checking);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-height: 84px;
+    padding: 14px 16px;
+    border-radius: 18px;
+    background:
+        linear-gradient(155deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0) 60%),
+        var(--hero-bg);
+    color: #fff;
+}
+
+.hero[data-state="on"]    { --hero-bg: var(--hero-on); }
+.hero[data-state="error"] { --hero-bg: var(--hero-error); }
+.hero[data-state="off"]   { --hero-bg: var(--hero-off); }
+
+.hero-icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.glyph {
+    width: 30px;
+    height: 30px;
+}
+
+.glyph .shield {
+    fill: rgba(255, 255, 255, 0.16);
+}
+
+.glyph .mark {
+    display: none;
+    stroke-width: 2.2;
+}
+
+.hero[data-state="on"] .mark-on,
+.hero[data-state="error"] .mark-error,
+.hero[data-state="off"] .mark-off,
+.hero[data-state="checking"] .mark-checking {
+    display: inline;
+}
+
+.hero[data-state="checking"] .mark-checking {
+    stroke-width: 3;
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+}
+
+.hero-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.hero-title {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    line-height: 1.2;
+}
+
+.hero-detail {
+    font-size: 12.5px;
+    line-height: 1.35;
+    opacity: 0.92;
+}
+
+.hero-detail:empty {
+    display: none;
+}
+
+/* ---------- Cards and rows ---------- */
+
+.card {
+    background: var(--surface);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+}
+
+.list {
+    list-style: none;
+}
+
+.list > * + * {
+    border-top: 1px solid var(--line);
+}
+
+.row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    min-height: var(--row-height);
+    padding: 8px 14px;
+}
+
+.row-button {
+    appearance: none;
+    border: 0;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+}
+
+.row-button:hover {
+    background: var(--surface-press);
+}
+
+.row-button:active {
+    background: var(--surface-press);
+}
+
+/* Rows sit flush inside a rounded card, so an inset highlight (which the card clips cleanly)
+   replaces the outline, whose square corners would be cut off. */
+body.keyboard .row-button:focus-visible {
+    outline: none;
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.row-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.row-title {
+    font-size: 14px;
+    font-weight: 550;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.row-sub {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.row-value {
+    flex: none;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.row-icon {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.row-icon svg {
+    width: 18px;
+    height: 18px;
+}
+
+.chevron {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin-left: -4px;
+    color: var(--muted);
+    opacity: 0.7;
+}
+
+/* This website */
+
+.site-card .row {
+    min-height: 64px;
+}
+
+.badge {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 16px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.badge-globe {
+    display: none;
+    width: 20px;
+    height: 20px;
+}
+
+.site-card[data-empty="true"] .badge-letter { display: none; }
+.site-card[data-empty="true"] .badge-globe  { display: block; }
+
+.site-card[data-filtered="false"] .badge {
+    background: var(--warn-soft);
+    color: var(--warn);
+}
+
+/* ---------- Switch ---------- */
+
+.switch {
+    --knob: calc(var(--switch-height) - 4px);
+    position: relative;
+    flex: none;
+    display: inline-block;
+    width: var(--switch-width);
+    height: var(--switch-height);
+}
+
+.switch input {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+.switch-track {
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: var(--track-off);
+    transition: background-color 0.2s;
+}
+
+.switch-track::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: var(--knob);
+    height: var(--knob);
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+    transition: transform 0.2s, background-color 0.2s;
+}
+
+.switch input:checked + .switch-track {
+    background: var(--track-on);
+}
+
+.switch input:checked + .switch-track::after {
+    transform: translateX(calc(var(--switch-width) - var(--switch-height)));
+}
+
+body.keyboard .switch input:focus-visible + .switch-track {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.switch input:disabled {
+    cursor: default;
+}
+
+.switch input:disabled + .switch-track {
+    opacity: 0.5;
+}
+
+/* On the coloured status card the switch is white, and its knob takes the card's colour. */
+.switch-on-hero .switch-track {
+    background: rgba(255, 255, 255, 0.32);
+}
+
+.switch-on-hero input:checked + .switch-track {
+    background: #fff;
+}
+
+.switch-on-hero input:checked + .switch-track::after {
+    background: var(--hero-bg);
+}
+
+body.keyboard .switch-on-hero input:focus-visible + .switch-track {
+    outline-color: #fff;
+}
+
+/* ---------- Buttons and fields ---------- */
+
+.btn {
+    appearance: none;
+    flex: none;
+    min-height: var(--control-height);
+    padding: 0 16px;
+    border: 0;
+    border-radius: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+}
+
+.btn:active {
+    transform: scale(0.98);
+    opacity: 0.85;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.btn-primary {
+    background: var(--btn);
+    color: #fff;
+}
+
+.btn-secondary {
+    background: var(--surface);
+    box-shadow: inset 0 0 0 1px var(--line);
+    color: var(--text);
+}
+
+.btn-danger {
+    background: var(--danger);
+    color: #fff;
+}
+
+.btn-small {
+    min-height: 32px;
+    padding: 0 12px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 13px;
+}
+
+.btn-quiet {
+    min-height: 32px;
+    padding: 0 8px;
+    background: none;
+    color: var(--danger);
+    font-size: 13px;
+    font-weight: 550;
+}
+
+input[type="text"],
+input[type="password"] {
+    width: 100%;
+    min-width: 0;
+    height: var(--control-height);
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--surface);
+}
+
+input[type="text"]::placeholder,
+input[type="password"]::placeholder {
+    color: var(--muted);
+    opacity: 0.8;
+}
+
+input[type="text"]:focus,
+input[type="password"]:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.form-error {
+    color: var(--danger);
+    font-size: 12.5px;
+    font-weight: 500;
+}
+
+/* ---------- Excluded websites ---------- */
+
+.intro {
+    order: -2;
+    color: var(--muted);
+    font-size: 12.5px;
+}
+
+.add-form {
+    display: flex;
+    gap: 8px;
+}
+
+.excluded-list .row {
+    min-height: 48px;
+}
+
+/* A long hostname wraps rather than losing its ending (the part that matters). */
+.excluded-list .row-title {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.pill {
+    flex: none;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: var(--warn-soft);
+    color: var(--warn);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 22px 12px 14px;
+    color: var(--muted);
+    text-align: center;
+}
+
+.empty svg {
+    width: 38px;
+    height: 38px;
+    margin-bottom: 6px;
+    opacity: 0.6;
+}
+
+.empty strong {
+    color: var(--text);
+    font-size: 14px;
+}
+
+.password-card .row-sub {
+    white-space: normal;
+}
+
+.password-card[data-set="false"] {
+    order: -1;
+    background: var(--warn-soft);
+    box-shadow: none;
+}
+
+.password-card[data-set="false"] .btn-small {
+    background: var(--btn);
+    color: #fff;
+}
+
+/* ---------- Activity ---------- */
+
+.tiles {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.tile {
+    display: flex;
+    flex-direction: column;
+    padding: 12px 14px;
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+}
+
+.tile-value {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+    font-variant-numeric: tabular-nums;
+}
+
+.tile-value[data-alert="true"] {
+    color: var(--danger);
+}
+
+.tile-label {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.note {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.facts > div {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+}
+
+.facts > div + div {
+    border-top: 1px solid var(--line);
+}
+
+.facts dt {
+    color: var(--muted);
+}
+
+.facts dd {
+    text-align: right;
+    font-weight: 550;
+    font-variant-numeric: tabular-nums;
+}
+
+#clearCache {
+    width: 100%;
+}
+
+/* ---------- Prompt and toast ---------- */
+
+/* The popup is a fixed 420px, which fits the tallest prompt (change password with an error
+   showing). `margin: auto` centres the dialog, and if it is ever taller than the popup it
+   starts at the top and the backdrop scrolls instead of clipping it. */
+.dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: flex;
+    padding: 16px;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.42);
+    animation: fade-in 0.12s ease-out;
+}
+
+.dialog {
+    width: 100%;
+    max-width: 300px;
+    margin: auto;
+    padding: 18px;
+    border-radius: 18px;
+    background: var(--surface);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+    animation: pop 0.16s ease-out;
+}
+
+@keyframes pop {
+    from { opacity: 0; transform: scale(0.96); }
+    to   { opacity: 1; transform: none; }
+}
+
+.dialog h2 {
+    font-size: 16px;
+    font-weight: 700;
+}
+
+.dialog-text {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12.5px;
+}
+
+#dialogFields {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+#dialogFields:not(:empty) {
+    margin-top: 14px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.field-hint {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.dialog .form-error {
+    margin-top: 10px;
+}
+
+.dialog-buttons {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.dialog-buttons .btn {
+    flex: 1;
+}
+
+.toast {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 14px;
+    z-index: 30;
+    width: max-content;
+    max-width: calc(100% - 28px);
+    margin: 0 auto;
+    padding: 9px 14px;
+    border-radius: 12px;
+    background: var(--text);
+    color: var(--bg);
+    font-size: 13px;
+    font-weight: 550;
+    text-align: center;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+    animation: toast-in 0.2s ease-out;
+}
+
+.toast[data-kind="error"] {
+    background: var(--danger);
+    color: #fff;
+}
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation: none !important;
+        transition: none !important;
+    }
+}
+
+/* iPhone / iPad: Safari shows the popup in a full-width sheet, not a fixed-size desktop
+   popover, so fill the sheet and use touch-sized controls. -webkit-touch-callout exists
+   only on iOS WebKit. 16px inputs stop iOS zooming the page when one is focused. */
+@supports (-webkit-touch-callout: none) {
+    :root {
+        --font-size: 16px;
+        --row-height: 56px;
+        --control-height: 46px;
+        --switch-width: 51px;
+        --switch-height: 31px;
+        --width: 100%;
+    }
+
+    body {
+        min-height: 100vh;
+    }
+
+    .screen {
+        height: auto;
+        min-height: 100vh;
+    }
+
+    .screen-body {
+        overflow: visible;
+    }
+
+    h1 { font-size: 17px; }
+    .row-title { font-size: 16px; }
+    .row-sub, .version, .note, .intro { font-size: 13px; }
+    .hero-title { font-size: 20px; }
+    .hero-detail { font-size: 14px; }
+    .tile-label, .pill, .form-group label, .field-hint { font-size: 13px; }
+    .btn-small, .btn-quiet, .toast, .form-error { font-size: 15px; }
+    .back { min-height: 44px; }
+    .btn-small, .btn-quiet { min-height: 40px; }
+    .site-card .row { min-height: 72px; }
+}

@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+
+# Environment / secrets
+.env
+.env.*
+
+# Python
+.venv/
+.venv311/
+__pycache__/
+*.pyc
+*.pyo
+
+# Server runtime
+server/models/
+server/gunicorn.pid
+*.log
+
+# Editors
+.idea/
+.vscode/
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+*.xcworkspace
+DerivedData/
+*.xccheckout
+*.moved-aside
+# Claude Code (per-user settings)
+.claude/settings.local.json

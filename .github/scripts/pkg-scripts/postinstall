@@ -1,0 +1,122 @@
+#!/bin/bash
+# postinstall — runs as root after the .app is copied to /Applications.
+# Creates user-level directories and installs the LaunchAgent so the
+# filter server starts automatically at login.
+set -euo pipefail
+
+APP="/Applications/Image-Filter_Service.app"
+
+# ── Identify the installing user ─────────────────────────────────────────────
+CURRENT_USER=$(scutil <<< "show State:/Users/ConsoleUser" \
+    | awk '/Name :/ && ! /loginwindow/ { print $3 }')
+[ -z "$CURRENT_USER" ] && CURRENT_USER=$(logname 2>/dev/null || true)
+[ -z "$CURRENT_USER" ] && exit 0
+
+USER_HOME=$(dscl . -read "/Users/$CURRENT_USER" NFSHomeDirectory 2>/dev/null \
+    | awk 'NR==1 { print $NF }')
+[ -z "$USER_HOME" ] && USER_HOME="/Users/$CURRENT_USER"
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+APP_SUPPORT="$USER_HOME/Library/Application Support/Image-Filter-Service"
+LOG_DIR="$USER_HOME/Library/Logs/Image-Filter-Service"
+LAUNCH_AGENTS="$USER_HOME/Library/LaunchAgents"
+PLIST="$LAUNCH_AGENTS/com.imagefilter.server.plist"
+
+# ── Create directories ────────────────────────────────────────────────────────
+sudo -u "$CURRENT_USER" mkdir -p \
+    "$APP_SUPPORT" \
+    "$LOG_DIR" \
+    "$LAUNCH_AGENTS"
+
+# ── Write LaunchAgent ─────────────────────────────────────────────────────────
+# The LaunchAgent runs the host app as a lightweight background WATCHER
+# (accessory mode, no Dock icon, ~0% CPU idle). The watcher starts the heavy
+# server (gunicorn + MediaPipe) when Safari launches and stops it when Safari
+# quits — so the resource-heavy server only runs while Safari is open, while the
+# watcher itself stays alive to catch every Safari launch reliably.
+#
+#   RunAtLoad — start the watcher at login (and right now, on install).
+#   KeepAlive — relaunch the watcher immediately if it ever crashes/quits, so the
+#               "start the server when Safari opens" guarantee never lapses. The
+#               watcher only starts the server when Safari is actually running
+#               (enforced in Swift), so KeepAlive does NOT mean the server runs
+#               while Safari is closed.
+sudo -u "$CURRENT_USER" tee "$PLIST" > /dev/null << PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.imagefilter.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$APP/Contents/MacOS/Image-Filter_Service</string>
+        <string>--start-server-only</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$LOG_DIR/host.log</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG_DIR/host_error.log</string>
+</dict>
+</plist>
+PLIST_EOF
+
+# ── Remove stray registrations of this app ────────────────────────────────────
+# Every build (Xcode, xcodebuild) registers its own copy of the Safari extension under the same
+# ID. With several copies registered, Safari can resolve the ID to one the user never switched
+# on: the extension is then off at the next launch, and Safari's state API alternates between
+# answers and "not found". Keep only the copy in /Applications. (pluginkit hides duplicates
+# unless it is given -D.) Registrations are per user, so this runs as the console user; only
+# registrations are removed, never files.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+EXT_ID="FelzyTech.Image-Filter-Service.Extension"
+
+as_user() { sudo -u "$CURRENT_USER" "$@"; }
+# stdin: `pluginkit -mADv` output. Prints the extension path of every copy that is not inside $APP.
+stray_extensions() { awk -F'\t' 'NF >= 4 { print $4 }' | grep -v "^$APP/" || true; }
+# stdin: `lsregister -dump` output. Prints every registered Image-Filter_Service.app except $APP.
+stray_apps() {
+    grep -E '^path:.*Image-Filter_Service\.app \(0x' \
+        | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | grep -vx "$APP" | sort -u || true
+}
+
+as_user pluginkit -mADv -i "$EXT_ID" 2>/dev/null | stray_extensions | while IFS= read -r appex; do
+    as_user pluginkit -r "$appex" 2>/dev/null || true
+done || true
+as_user "$LSREGISTER" -dump 2>/dev/null | stray_apps | while IFS= read -r app; do
+    as_user "$LSREGISTER" -u "$app" 2>/dev/null || true
+done || true
+
+# ── (Re)load the LaunchAgent ──────────────────────────────────────────────────
+# This is the heart of the install/upgrade handoff: tear down whatever the
+# previous version left running, then load the new watcher fresh.
+USER_ID=$(id -u "$CURRENT_USER")
+
+# 1. Unload any previously running watcher cleanly (also stops its server).
+launchctl bootout "gui/$USER_ID/com.imagefilter.server" 2>/dev/null || true
+
+# 2. Clean handoff: make sure no stale server from the old version is left
+#    holding port 10000, so the freshly-loaded watcher starts a clean server.
+PID_FILE="$APP_SUPPORT/gunicorn.pid"
+if [ -f "$PID_FILE" ]; then
+    OLD_PID=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [ -n "${OLD_PID:-}" ]; then
+        # gunicorn runs in its own process group — kill the whole group.
+        kill -TERM "-$OLD_PID" 2>/dev/null || kill -TERM "$OLD_PID" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+fi
+# Belt-and-suspenders: kill any stray gunicorn still serving our app.
+pkill -f 'gunicorn.*app:app' 2>/dev/null || true
+
+# 3. Load the new watcher. RunAtLoad launches it immediately; if Safari is open
+#    right now it starts the server at once, otherwise it waits for Safari.
+#    bootstrap works from the root context on macOS 10.11+.
+launchctl bootstrap "gui/$USER_ID" "$PLIST" 2>/dev/null || \
+    sudo -u "$CURRENT_USER" launchctl load -w "$PLIST" 2>/dev/null || true
+
+exit 0

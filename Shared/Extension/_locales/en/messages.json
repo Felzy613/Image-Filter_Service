@@ -1,0 +1,10 @@
+{
+    "extension_name": {
+        "message": "Image Filter Service",
+        "description": "The display name for the extension."
+    },
+    "extension_description": {
+        "message": "Automatically filters images containing human skin, providing a kosher browsing experience by sending images to a processing server.",
+        "description": "Description of what the extension does."
+    }
+}

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Filter Service</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body class="loading">
+    <!-- Three screens: main (status + this website), excluded websites, activity.
+         popup.js shows one at a time. -->
+    <div class="app" id="app">
+
+        <!-- ============ Main ============ -->
+        <main class="screen" id="screen-main">
+            <header class="app-header">
+                <h1 data-title tabindex="-1">Image Filter Service</h1>
+                <span class="version" id="extensionVersion"></span>
+            </header>
+
+            <div class="screen-body">
+                <!-- Is it working? One colour, one sentence. -->
+                <section class="hero" id="hero" data-state="checking" aria-live="polite">
+                    <span class="hero-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" class="glyph">
+                            <path class="shield" d="M12 3l7.5 3v5.2c0 4.6-3.1 8.2-7.5 9.8-4.4-1.6-7.5-5.2-7.5-9.8V6z"/>
+                            <path class="mark mark-on" d="M8.6 12.2l2.3 2.3 4.5-4.7"/>
+                            <path class="mark mark-error" d="M12 8.2v4.4M12 15.6v.01"/>
+                            <path class="mark mark-off" d="M10.2 9.2v5.6M13.8 9.2v5.6"/>
+                            <path class="mark mark-checking" d="M9 12h.01M12 12h.01M15 12h.01"/>
+                        </svg>
+                    </span>
+                    <span class="hero-text">
+                        <span class="hero-title" id="heroTitle">Checking…</span>
+                        <span class="hero-detail" id="heroDetail"></span>
+                    </span>
+                    <!-- The off switch exists only on iPhone/iPad; on the Mac filtering is always on. -->
+                    <label class="switch switch-on-hero" id="enableSwitch" hidden>
+                        <input type="checkbox" id="enableToggle" role="switch" aria-label="Filtering">
+                        <span class="switch-track"></span>
+                    </label>
+                </section>
+
+                <!-- The thing people do most: this website on or off. -->
+                <section class="card site-card" id="siteCard" aria-label="This website">
+                    <div class="row">
+                        <span class="badge" aria-hidden="true">
+                            <span class="badge-letter" id="siteLetter"></span>
+                            <svg class="badge-globe" viewBox="0 0 24 24">
+                                <circle cx="12" cy="12" r="8.5"/>
+                                <path d="M3.5 12h17M12 3.5c2.6 2.4 3.6 5.3 3.6 8.5s-1 6.1-3.6 8.5c-2.6-2.4-3.6-5.3-3.6-8.5s1-6.1 3.6-8.5z"/>
+                            </svg>
+                        </span>
+                        <span class="row-text">
+                            <span class="row-title" id="siteHost"></span>
+                            <span class="row-sub" id="siteState"></span>
+                        </span>
+                        <label class="switch" id="siteSwitch" hidden>
+                            <input type="checkbox" id="siteToggle" role="switch"
+                                   aria-labelledby="siteHost siteState">
+                            <span class="switch-track"></span>
+                        </label>
+                    </div>
+                </section>
+
+                <nav class="card list" aria-label="More">
+                    <button type="button" class="row row-button" id="goExcluded">
+                        <span class="row-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></svg>
+                        </span>
+                        <span class="row-text"><span class="row-title">Excluded websites</span></span>
+                        <span class="row-value" id="excludedCount"></span>
+                        <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+                    </button>
+                    <button type="button" class="row row-button" id="goActivity">
+                        <span class="row-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24"><path d="M5.5 19.5v-7M12 19.5v-15M18.5 19.5v-10"/></svg>
+                        </span>
+                        <span class="row-text"><span class="row-title">Activity</span></span>
+                        <span class="row-value" id="activityCount"></span>
+                        <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+                    </button>
+                </nav>
+            </div>
+        </main>
+
+        <!-- ============ Excluded websites ============ -->
+        <section class="screen" id="screen-excluded" hidden>
+            <header class="sub-header">
+                <button type="button" class="back" data-back>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+                    Back
+                </button>
+                <h1 data-title tabindex="-1">Excluded websites</h1>
+            </header>
+
+            <div class="screen-body">
+                <p class="intro">Pictures on these websites, and their subdomains, are shown without filtering.</p>
+
+                <form class="add-form" id="excludeForm" novalidate>
+                    <input type="text" id="excludeInput" inputmode="url" autocapitalize="off"
+                           autocorrect="off" spellcheck="false" placeholder="example.com"
+                           aria-label="Website to exclude">
+                    <button type="submit" class="btn btn-primary">Add</button>
+                </form>
+                <p class="form-error" id="excludeError" role="alert" hidden></p>
+
+                <ul class="card list excluded-list" id="excludedList"></ul>
+
+                <div class="empty" id="excludedEmpty">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 3l7.5 3v5.2c0 4.6-3.1 8.2-7.5 9.8-4.4-1.6-7.5-5.2-7.5-9.8V6z"/>
+                        <path d="M8.6 12.2l2.3 2.3 4.5-4.7"/>
+                    </svg>
+                    <strong>Nothing excluded</strong>
+                    <span>Every website is filtered.</span>
+                </div>
+
+                <!-- Mac only: excluding a website needs this password. -->
+                <section class="card password-card" id="passwordCard" data-set="false" hidden>
+                    <div class="row">
+                        <span class="row-text">
+                            <span class="row-title" id="passwordTitle"></span>
+                            <span class="row-sub" id="passwordState"></span>
+                        </span>
+                        <button type="button" class="btn btn-small" id="passwordButton"></button>
+                    </div>
+                </section>
+            </div>
+        </section>
+
+        <!-- ============ Activity ============ -->
+        <section class="screen" id="screen-activity" hidden>
+            <header class="sub-header">
+                <button type="button" class="back" data-back>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>
+                    Back
+                </button>
+                <h1 data-title tabindex="-1">Activity</h1>
+            </header>
+
+            <div class="screen-body">
+                <div class="tiles">
+                    <div class="tile">
+                        <span class="tile-value" id="statProcessed">0</span>
+                        <span class="tile-label">Checked</span>
+                    </div>
+                    <div class="tile">
+                        <span class="tile-value" id="statFiltered">0</span>
+                        <span class="tile-label">Filtered</span>
+                    </div>
+                    <div class="tile">
+                        <span class="tile-value" id="statFailed">0</span>
+                        <span class="tile-label">Failed</span>
+                    </div>
+                    <div class="tile">
+                        <span class="tile-value" id="statCached">0</span>
+                        <span class="tile-label">Cached</span>
+                    </div>
+                </div>
+                <p class="note">Pictures that fail to load or be checked stay hidden and are retried automatically. Counts start over when Safari restarts the extension.</p>
+
+                <dl class="card facts" id="facts" hidden></dl>
+
+                <button type="button" class="btn btn-secondary" id="clearCache">Clear cache</button>
+            </div>
+        </section>
+    </div>
+
+    <!-- Confirmation / password prompt (filled in by popup.js) -->
+    <div class="dialog-backdrop" id="dialog" hidden>
+        <form class="dialog" id="dialogForm" role="dialog" aria-modal="true"
+              aria-labelledby="dialogTitle" autocomplete="off">
+            <h2 id="dialogTitle"></h2>
+            <p class="dialog-text" id="dialogText"></p>
+            <div id="dialogFields"></div>
+            <p class="form-error" id="dialogError" role="alert" hidden></p>
+            <div class="dialog-buttons">
+                <button type="button" class="btn btn-secondary" id="dialogCancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="dialogOk">OK</button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Short confirmations ("example.com excluded") -->
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required: sandbox must be declared explicitly when CODE_SIGN_ENTITLEMENTS is set -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- Required: background.js fetches to localhost:10000 — blocked without this -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+</dict>
+</plist>

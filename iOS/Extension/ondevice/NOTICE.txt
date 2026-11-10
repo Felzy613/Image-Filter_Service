@@ -1,0 +1,17 @@
+On-device filtering assets (iOS extension)
+
+vision_bundle.js, vision_wasm_internal.js, vision_wasm_internal.wasm
+    From the npm package @mediapipe/tasks-vision 0.10.32 (same MediaPipe version as
+    server/requirements.txt). vision_bundle.js is the package's vision_bundle.mjs with the
+    source-map comment removed; only the SIMD WebAssembly build is included.
+    Copyright Google LLC. Licensed under the Apache License, Version 2.0.
+    https://github.com/google-ai-edge/mediapipe
+
+selfie_multiclass_256x256.tflite
+    MediaPipe Selfie Multiclass segmentation model (float32, version 1) — the same file the
+    server downloads (SEGMENTATION_MODEL_URL). Licensed under the Apache License, Version 2.0.
+    https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite
+
+Re-create or update these files with scripts/fetch_ondevice_assets.sh.
+
+engine.js is this project's own code.

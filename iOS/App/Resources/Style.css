@@ -1,0 +1,52 @@
+* {
+    -webkit-user-drag: none;
+}
+
+:root {
+    color-scheme: light dark;
+
+    --spacing: 16px;
+}
+
+html {
+    min-height: 100%;
+}
+
+body {
+    display: flex;
+    align-items: center;
+    flex-direction: column;
+
+    gap: var(--spacing);
+    margin: 0;
+    padding: calc(var(--spacing) * 3) calc(var(--spacing) * 1.5);
+
+    font: -apple-system-short-body;
+}
+
+h1 {
+    margin: 0;
+    font: -apple-system-title2;
+    text-align: center;
+}
+
+ol {
+    margin: 0;
+    padding-left: 1.4em;
+    max-width: 32em;
+}
+
+li {
+    margin-bottom: 0.75em;
+}
+
+.note {
+    margin: 0;
+    max-width: 32em;
+    font: -apple-system-footnote;
+    opacity: 0.7;
+}
+
+code {
+    font-family: ui-monospace, Menlo, monospace;
+}
