@@ -24,6 +24,30 @@
     const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'HEAD', 'TITLE', 'NOSCRIPT',
         'TEMPLATE', 'BR', 'WBR', 'SOURCE', 'TRACK', 'PARAM', 'BASE']);
     const SVG_NS = 'http://www.w3.org/2000/svg';
+    // --- Keeping the work per mutation small -----------------------------------------------------
+    // Every picture is suppressed by CSS until it has been probed and checked, so WHEN an element is
+    // re-read is only a question of latency, never of leaking. What must stay cheap is the probe
+    // itself (it flips an attribute on each element and forces a style recalculation), because a page
+    // can mutate hundreds of times a second (animations, carousels, SPAs toggling classes).
+    //  - an inline-style change is only re-probed if the old or new style text mentions something that
+    //    can supply a picture (background, list-style, border-image, content, url(), a custom property,
+    //    or `all`); transform/opacity/left/... animations cost nothing;
+    //  - a class/id change re-probes the element and at most DESC_CAP descendants; bigger subtrees go
+    //    to the chunked sweep;
+    //  - attribute-driven probes are throttled (leading edge now, then at most one batch per ATTR_GAP);
+    //  - a batch probes SYNC_MAX elements at once and the rest in chunks across later frames.
+    const IMAGE_STYLE_RE = /background|list-style|border-image|content|url\(|--|\ball\b/i;
+    const DESC_CAP = 40;
+    const SYNC_MAX = 200;
+    const ATTR_GAP = 120;
+    const REPROBE_QUIET_MS = 30000;   // the safety-net sweep skips elements probed this recently
+    const lastProbe = new WeakMap();  // el -> performance.now() of its last probe
+    const later = fn => {             // next frame, or soon after if frames aren't running (hidden)
+        let done = false;
+        const run = () => { if (!done) { done = true; fn(); } };
+        requestAnimationFrame(run);
+        setTimeout(run, 50);
+    };
     const URL_RE = /url\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^)\s]*))\s*\)/g;
 
     // el -> { pins: {prop: {value, source}}, page: {prop: {value, priority}}, pseudo: {before, after} }
@@ -141,12 +165,32 @@
             }
             out.push({ el, props, pseudo });
         }
+        const stamp = performance.now();
         for (const el of els) {
+            lastProbe.set(el, stamp);
             el.removeAttribute(PROBE);
             const rec = records.get(el);
             if (rec && (Object.keys(rec.pins).length || el.hasAttribute(PINNED))) applyPins(el, rec);
         }
         return out;
+    }
+
+    // A page's inline `!important` beats the suppression stylesheet, so such a picture would show at
+    // once. Cover it before the next paint with the last approved value (or nothing). This only reads
+    // the element's inline style (no style recalculation), so it runs synchronously for every element
+    // that changed or arrived, however much of the real probing is deferred or throttled.
+    function coverInlineImportant(el) {
+        const st = el.style;
+        if (!st || !st.length) return;
+        for (const prop of PROPS) {
+            if (st.getPropertyPriority(prop) !== 'important') continue;
+            const value = st.getPropertyValue(prop);
+            if (!value || value === 'none') continue;
+            const rec = records.get(el);
+            const pin = rec && rec.pins[prop];
+            if (pin && value === pin.value) continue;   // our own approved pin
+            pinValue(el, prop, pin ? pin.value : 'none', pin ? pin.source : null);
+        }
     }
 
     // Output resolution: what the element can show (its box × devicePixelRatio).
@@ -248,6 +292,71 @@
         return into;
     }
 
+    // A batch: the first SYNC_MAX elements now (before the next paint), the rest in chunks.
+    function processBatch(els, opts) {
+        process(els.slice(0, SYNC_MAX), opts);
+        if (els.length <= SYNC_MAX) return;
+        let i = SYNC_MAX;
+        const step = () => {
+            if (!IFS.enabled) return;
+            process(els.slice(i, i + CHUNK).filter(el => el.isConnected), opts);
+            i += CHUNK;
+            if (i < els.length) later(step);
+        };
+        later(step);
+    }
+
+    // Attribute-driven re-probes: the first one runs at once; more arriving within ATTR_GAP are
+    // merged into a single trailing batch.
+    const pendingAttr = new Set();
+    let attrTimer = null;
+    let lastAttrFlush = -Infinity;
+    function queueAttr(els) {
+        for (const el of els) pendingAttr.add(el);
+        const wait = ATTR_GAP - (performance.now() - lastAttrFlush);
+        if (wait <= 0) flushAttr();
+        else if (!attrTimer) attrTimer = setTimeout(flushAttr, wait);
+    }
+    function flushAttr() {
+        if (attrTimer) {
+            clearTimeout(attrTimer);
+            attrTimer = null;
+        }
+        lastAttrFlush = performance.now();
+        const els = [...pendingAttr].filter(el => el.isConnected);
+        pendingAttr.clear();
+        if (IFS.enabled && els.length) processBatch(els);
+    }
+
+    // A class/id change on an element with many descendants: re-read just that subtree (chunked), not
+    // the whole page, and not more than once a second per element (toggling a class on a big container
+    // is usually UI state). Descendants stay suppressed meanwhile, so this is latency only.
+    const SUBTREE_GAP = 1000;
+    const pendingSubtrees = new Set();
+    let subtreeTimer = null;
+    let lastSubtreeFlush = -Infinity;
+    function queueSubtree(root) {
+        pendingSubtrees.add(root);
+        const wait = SUBTREE_GAP - (performance.now() - lastSubtreeFlush);
+        if (wait <= 0) flushSubtrees();
+        else if (!subtreeTimer) subtreeTimer = setTimeout(flushSubtrees, wait);
+    }
+    function flushSubtrees() {
+        if (subtreeTimer) {
+            clearTimeout(subtreeTimer);
+            subtreeTimer = null;
+        }
+        lastSubtreeFlush = performance.now();
+        const roots = [...pendingSubtrees].filter(r => r.isConnected);
+        pendingSubtrees.clear();
+        if (!IFS.enabled || !roots.length) return;
+        const all = new Set();
+        for (const r of roots) for (const el of collect(r, [])) all.add(el);
+        const now = performance.now();
+        const stale = [...all].filter(el => now - (lastProbe.get(el) || -Infinity) > SUBTREE_GAP);
+        if (stale.length) processBatch(stale);
+    }
+
     // Re-read in chunks (stylesheet loaded, viewport resized, periodic safety net). Latency
     // only: anything new stays suppressed until then. Small chunks with a rendered frame in
     // between, so a long page never stalls (a full read of 5,000 elements is ~0.4 s of work).
@@ -267,16 +376,20 @@
         sweepTimer = null;
         if (!IFS.enabled) return;
         sweeping = true;
-        let els = [];
+        const els = [];
         for (const root of IFS.allRoots()) collect(root, els);
-        if (nearViewportOnly) els = els.filter(el => IFS.isNearViewport(el));
         let i = 0;
         const step = () => {
             if (!IFS.enabled) {
                 sweeping = false;
                 return;
             }
-            process(els.slice(i, i + CHUNK).filter(el => el.isConnected), { skipHovered: true });
+            let slice = els.slice(i, i + CHUNK).filter(el => el.isConnected);
+            if (nearViewportOnly) {
+                const now = performance.now();
+                slice = slice.filter(el => now - (lastProbe.get(el) || -Infinity) > REPROBE_QUIET_MS && IFS.isNearViewport(el));
+            }
+            process(slice, { skipHovered: true });
             i += CHUNK;
             if (i < els.length) {
                 requestAnimationFrame(() => setTimeout(step, 0));  // let a frame render first
@@ -298,36 +411,44 @@
         },
 
         onMutations(added, attrs) {
-            const els = [];
+            const addedEls = [];   // new nodes: nothing is known about them yet
+            const attrEls = [];    // existing nodes whose class/id/style changed
             const seen = new Set();
-            const add = el => {
+            const add = (list, el) => {
                 if (!seen.has(el) && isCandidate(el)) {
                     seen.add(el);
-                    els.push(el);
+                    list.push(el);
                 }
             };
             let sheetsChanged = false;
             for (const n of added) {
                 if (n.tagName === 'STYLE' || (n.tagName === 'LINK' && /stylesheet/i.test(n.rel))) sheetsChanged = true;
-                add(n);
-                for (const d of n.querySelectorAll('*')) add(d);
+                add(addedEls, n);
+                for (const d of n.querySelectorAll('*')) add(addedEls, d);
             }
             for (const r of attrs) {
                 const el = r.target;
                 if (r.attributeName === 'style') {
-                    if (el.getAttribute('style') !== ownStyle.get(el)) add(el);
+                    if (el.getAttribute('style') === ownStyle.get(el)) continue;
+                    // Animations rewrite transform/opacity/left... all the time; none of that can change a picture.
+                    if (!IMAGE_STYLE_RE.test(r.oldValue || '') && !IMAGE_STYLE_RE.test(el.getAttribute('style') || '')) continue;
+                    coverInlineImportant(el);
+                    add(attrEls, el);
                 } else if (r.attributeName === 'class' || r.attributeName === 'id') {
-                    add(el);
-                    // Descendant selectors (".dark .hero") change children too.
+                    add(attrEls, el);
+                    // Descendant selectors (".dark .hero") change children too: a few are re-probed
+                    // with the element, a bigger subtree is re-read separately (throttled, chunked).
                     const desc = el.getElementsByTagName('*');
-                    if (desc.length <= 400) {
-                        for (const d of desc) add(d);
+                    if (desc.length <= DESC_CAP) {
+                        for (const d of desc) add(attrEls, d);
                     } else {
-                        scheduleSweep();
+                        queueSubtree(el);
                     }
                 }
             }
-            process(els);
+            for (const el of addedEls) coverInlineImportant(el);
+            if (addedEls.length) processBatch(addedEls);
+            if (attrEls.length) queueAttr(attrEls);
             if (sheetsChanged) scheduleSweep();
         },
 
@@ -366,5 +487,14 @@
     window.addEventListener('load', () => scheduleSweep(0));
     // Safety net for changes nothing tells us about (rules inserted through the CSSOM, …):
     // only what's on or near the screen.
-    setInterval(() => scheduleSweep(0, true), 10000);
+    let lastSweepActivity = -1;
+    let lastSweepAt = -Infinity;
+    setInterval(() => {
+        if (document.hidden) return;
+        const now = performance.now();
+        if (IFS.activity === lastSweepActivity && now - lastSweepAt < 60000) return;  // nothing happened
+        lastSweepActivity = IFS.activity;
+        lastSweepAt = now;
+        scheduleSweep(0, true);
+    }, 10000);
 })();

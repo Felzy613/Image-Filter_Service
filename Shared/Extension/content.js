@@ -734,7 +734,13 @@
     }
     
     // Rescan frequently for lazy-loaded images - critical for religious compliance
-    setInterval(scanAndProcessImages, 250); // Scan every 250ms for faster pickup
+    // 250 ms while the page is active; once it has been still for a few seconds, once a second; never
+    // in a hidden tab (content-core.js IFS.shouldPoll). Images are hidden by CSS until checked, so this
+    // only affects how soon a lazy image is picked up, not whether it is hidden.
+    setInterval(() => {
+        const ifs = globalThis.__ifs;
+        if (!ifs || !ifs.shouldPoll || ifs.shouldPoll('img', 1000)) scanAndProcessImages();
+    }, 250);
     
     // Scan on scroll to catch images before they become visible
     let scrollTimeout;

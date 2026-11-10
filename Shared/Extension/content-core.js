@@ -23,6 +23,39 @@
     IFS.enabled = true;  // set from storage by content.js -> IFS.setEnabled
     IFS.log = (...args) => console.log('[Image Filter Service]', ...args);
 
+    // --- Activity: keeps the periodic safety nets cheap ------------------------------------
+    // Hiding is done by CSS, so a scan only decides WHEN a picture gets shown, never whether it is
+    // hidden. The polls therefore run at full speed only while the page is changing (a mutation, a
+    // load, scrolling, resizing, the tab being shown), slow down once it has been still for a few
+    // seconds, and stop in a hidden tab, where nothing is visible (the first poll after the tab is
+    // shown again runs at full speed). An idle, background or finished page costs almost nothing.
+    const ACTIVE_MS = 3000;
+    let lastActive = performance.now();
+    const lastPoll = {};
+    IFS.activity = 0;
+    IFS.touch = function () {
+        IFS.activity++;
+        lastActive = performance.now();
+    };
+    IFS.shouldPoll = function (key, idleEveryMs, activeEveryMs = 0) {
+        if (document.hidden) return false;
+        const now = performance.now();
+        if (now - lastActive <= ACTIVE_MS) {
+            if (now - (lastPoll[key] || 0) < activeEveryMs) return false;
+            lastPoll[key] = now;
+            return true;
+        }
+        if (now - (lastPoll[key] || 0) >= idleEveryMs) {
+            lastPoll[key] = now;
+            return true;
+        }
+        return false;
+    };
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) IFS.touch(); });
+    document.addEventListener('load', IFS.touch, true);
+    window.addEventListener('scroll', IFS.touch, { passive: true, capture: true });
+    window.addEventListener('resize', IFS.touch, { passive: true });
+
     // --- What is hidden until checked ------------------------------------------------
     // Hiding is instant (transition: none). Videos keep playing at opacity 0 (WebKit pauses
     // a muted autoplay video under visibility:hidden), and are not shown — their filtered
@@ -183,6 +216,7 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
         childList: true,
         subtree: true,
         attributes: true,
+        attributeOldValue: true,  // lets content-backgrounds.js ignore inline-style changes that can't affect a picture
         // (Namespaced attributes such as xlink:href are never reported with a filter; the
         // periodic scan re-checks those.)
         attributeFilter: ['style', 'class', 'id', 'src', 'srcset', 'href', 'poster', 'data', 'type',
@@ -215,6 +249,7 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
 
     const observer = new MutationObserver(records => {
         if (!IFS.enabled) return;
+        IFS.touch();
         IFS.ensureDocumentStyles();
         const added = [];
         const attrs = [];
@@ -230,6 +265,7 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
             }
         }
         for (const n of added) discoverRoots(n);
+        if (added.length) discoverDirty = true;
         for (const r of attrs) {
             if (r.attributeName === 'data-ifs-shadow' && r.target.shadowRoot) registerRoot(r.target.shadowRoot);
         }
@@ -239,16 +275,26 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     });
     observer.observe(document, OBSERVE);
 
+    // The whole-document walk for shadow roots is a safety net (added nodes are walked as they arrive,
+    // and page-world.js tags every shadow host, which the observer reports): it runs when nodes were
+    // added, and otherwise at most every 2 s.
+    let discoverDirty = true;
+    let lastDiscover = 0;
     function scanAll() {
-        if (!IFS.enabled) return;
-        discoverRoots(document);
+        if (!IFS.enabled || !IFS.shouldPoll('core', 2000, 500)) return;
+        const now = performance.now();
+        if (discoverDirty || now - lastDiscover > 2000) {
+            discoverDirty = false;
+            lastDiscover = now;
+            discoverRoots(document);
+        }
         for (const root of IFS.allRoots()) {
             if (root !== document) ensureRootStyles(root);
         }
         for (const m of modules) if (m.tick) m.tick();
     }
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', scanAll);
+        document.addEventListener('DOMContentLoaded', () => { IFS.touch(); scanAll(); });
     }
     setInterval(scanAll, 250);
 

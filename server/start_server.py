@@ -57,6 +57,10 @@ try:
             'app:app',
         ],
         env=env,
+        # Lower priority than Safari: a page with many pictures keeps the model threads busy, and at
+        # normal priority that starves Safari and the window server (the whole Mac feels frozen).
+        # Checks only get slower when the CPU is contended.
+        preexec_fn=lambda: os.nice(10),
         stdout=open(os.path.join(log_dir, 'server.log'), 'a'),
         stderr=open(os.path.join(log_dir, 'server_error.log'), 'a'),
         start_new_session=True,

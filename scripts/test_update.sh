@@ -114,6 +114,9 @@ for _ in $(seq 1 50); do [ -s "$OUT/port" ] && break; sleep 0.1; done
 grep -q "PYTHONPYCACHEPREFIX" server/start_server.py \
     || { echo "FAIL: server/start_server.py no longer sets PYTHONPYCACHEPREFIX (a user-owned bundle would get __pycache__ and a broken signature)"; exit 1; }
 
+grep -q "os.nice" server/start_server.py \
+    || { echo "FAIL: server/start_server.py no longer lowers the server's priority (a burst of image checks could starve Safari)"; exit 1; }
+
 # The CI "verify" step must accept the good file and refuse the bad ones.
 "$SIGN" verify "$SRV/ok/update.json" --public-key "$PUB" --asset "$SRV/ok/cdn/IFSTest-1.0.1.zip" >/dev/null \
     || { echo "FAIL: sign_update verify rejected a good manifest"; exit 1; }
