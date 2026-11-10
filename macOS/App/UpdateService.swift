@@ -329,7 +329,7 @@ nonisolated final class UpdateService: @unchecked Sendable {
         do {
             try performInstall(staged)
             updateState { $0.staged = nil; $0.installedVersion = staged.version; $0.failedInstalls[staged.version] = nil }
-            try? fm.removeItem(at: options.root.appendingPathComponent("staged/\(staged.version)"))
+            removeTree(options.root.appendingPathComponent("staged/\(staged.version)"))
             log("installed \(staged.version) (was \(options.currentVersion))")
             return staged.version
         } catch {
@@ -364,6 +364,24 @@ nonisolated final class UpdateService: @unchecked Sendable {
         if options.registerWithLaunchServices { registerWithLaunchServices(installed) }
         disposeOld(old)
         removeStaleLeftovers(beside: installed)
+        removeLeftoverRegistrations()
+    }
+
+    /// Launch Services follows a registered bundle when it is renamed or moved, so the REPLACED app and
+    /// its extension are registered again at their new path a moment AFTER the swap, even if they were
+    /// unregistered first (measured live: two registrations of the extension, 1.9.2 at the hidden
+    /// leftover and 1.9.3 in /Applications). So this runs after the swap has settled and again whenever
+    /// the watcher starts. It only unregisters copies under the updater's own leftover locations.
+    func removeLeftoverRegistrations() {
+        let installed = options.installedApp
+        let parent = installed.deletingLastPathComponent().path
+        let prefixes = ["\(parent)/.\(installed.lastPathComponent).replaced-", options.root.path + "/"]
+        let output = runCapture("/usr/bin/pluginkit", ["-mADv", "-i", UpdateConfig.extensionBundleID])
+        for appex in UpdateRegistrations.strayAppexPaths(pluginkitOutput: output, ownedPrefixes: prefixes) {
+            runSync("/usr/bin/pluginkit", ["-r", appex])
+            if let app = UpdateRegistrations.appPath(containing: appex) { runSync(lsregister, ["-u", app]) }
+            log("unregistered a leftover copy of the extension at \(appex)")
+        }
     }
 
     /// The first update after a .pkg install can't delete the old bundle (it belongs to root, see
@@ -375,7 +393,7 @@ nonisolated final class UpdateService: @unchecked Sendable {
         let prefix = ".\(installed.lastPathComponent).replaced-"
         for entry in (try? fm.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil)) ?? []
         where entry.lastPathComponent.hasPrefix(prefix) {
-            try? fm.removeItem(at: entry)
+            removeTree(entry)
         }
     }
 
@@ -418,6 +436,10 @@ nonisolated final class UpdateService: @unchecked Sendable {
     /// by root and can't be deleted by the user; it is then left in Application Support, where
     /// nothing scans for apps.
     private func disposeOld(_ old: URL) {
+        // A bundle we own may contain read-only folders (e.g. server/ made read-only by hand to stop the
+        // server writing into it), which would stop the files inside from being deleted. Not our files to
+        // protect any more: make them writable first. For a root-owned bundle this simply fails.
+        runSync("/bin/chmod", ["-R", "u+w", old.path])
         let plugIns = old.appendingPathComponent("Contents/PlugIns")
         for appex in ((try? fm.contentsOfDirectory(at: plugIns, includingPropertiesForKeys: nil)) ?? [])
         where appex.pathExtension == "appex" {
@@ -436,15 +458,15 @@ nonisolated final class UpdateService: @unchecked Sendable {
     // MARK: Housekeeping
 
     private func cleanWorkAreas() {
-        try? fm.removeItem(at: options.root.appendingPathComponent("download"))
-        try? fm.removeItem(at: options.root.appendingPathComponent("extract"))
+        removeTree(options.root.appendingPathComponent("download"))
+        removeTree(options.root.appendingPathComponent("extract"))
         // Staged copies that are no longer needed (installed, or older than what is running).
         let keep = loadState().staged?.version
         let stagedRoot = options.root.appendingPathComponent("staged", isDirectory: true)
         for entry in (try? fm.contentsOfDirectory(at: stagedRoot, includingPropertiesForKeys: nil)) ?? [] {
             let version = entry.lastPathComponent
             if version != keep || !UpdateVersion.isNewer(version, than: options.currentVersion) {
-                try? fm.removeItem(at: entry)
+                removeTree(entry)
             }
         }
         updateState { state in
@@ -495,6 +517,26 @@ nonisolated final class UpdateService: @unchecked Sendable {
         } else {
             try? line.write(to: file)
         }
+    }
+
+    /// Deletes a folder we own, including read-only folders inside it: an owner can always make its own
+    /// folders writable first (this simply fails for a bundle that belongs to root).
+    private func removeTree(_ url: URL) {
+        runSync("/bin/chmod", ["-R", "u+w", url.path])
+        try? fm.removeItem(at: url)
+    }
+
+    private func runCapture(_ path: String, _ arguments: [String]) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return "" }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
     }
 
     @discardableResult

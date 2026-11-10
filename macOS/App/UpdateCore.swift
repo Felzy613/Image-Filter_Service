@@ -274,3 +274,26 @@ nonisolated enum UpdateGate {
         return now >= lastAttempt.addingTimeInterval(wait) || now < lastAttempt
     }
 }
+
+// MARK: - Registrations of the replaced app
+
+nonisolated enum UpdateRegistrations {
+    /// `pluginkit -mADv -i <id>` prints one line per registered copy of the extension; the path is the
+    /// last of four tab-separated fields. Returns the copies that live under one of `ownedPrefixes`
+    /// (the updater's own leftovers) and nothing else, so the installed app and any other copy (a dev
+    /// build, say) are never touched.
+    static func strayAppexPaths(pluginkitOutput: String, ownedPrefixes: [String]) -> [String] {
+        pluginkitOutput.split(separator: "\n").compactMap { line -> String? in
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count >= 4 else { return nil }
+            let path = fields[3].trimmingCharacters(in: .whitespaces)
+            return ownedPrefixes.contains { path.hasPrefix($0) } ? path : nil
+        }
+    }
+
+    /// ".../X.app/Contents/PlugIns/Y.appex" gives ".../X.app".
+    static func appPath(containing appex: String) -> String? {
+        guard let range = appex.range(of: "/Contents/PlugIns/") else { return nil }
+        return String(appex[..<range.lowerBound])
+    }
+}

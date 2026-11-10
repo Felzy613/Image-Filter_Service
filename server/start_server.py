@@ -38,6 +38,10 @@ os.chdir(server_dir)
 env = os.environ.copy()
 env['PATH'] = venv_bin + ':' + env.get('PATH', '')
 env['VIRTUAL_ENV'] = venv_root
+# Keep Python's bytecode cache OUT of the app bundle. After the app has updated itself the bundle belongs
+# to the user, so Python could write Contents/Resources/server/__pycache__ into it and break the app's
+# code signature ("file added"). With a cache prefix the .pyc files go to the user's Caches folder instead.
+env.setdefault('PYTHONPYCACHEPREFIX', os.path.expanduser('~/Library/Caches/Image-Filter-Service/pycache'))
 
 try:
     subprocess.Popen(

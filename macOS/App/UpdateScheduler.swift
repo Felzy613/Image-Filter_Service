@@ -50,6 +50,12 @@ final class UpdateScheduler {
         timer.tolerance = 10
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+        // The watcher that starts right after an update sweeps away the replaced copy's registrations.
+        let service = self.service
+        Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            service.removeLeftoverRegistrations()
+        }
         // An update staged earlier may be installable right now (Safari is often closed at login).
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.tick() }
         logger.info("Self-update scheduler started")
@@ -95,6 +101,10 @@ final class UpdateScheduler {
         Task.detached(priority: .utility) {
             do {
                 _ = try service.installPending()
+                // Launch Services re-registers the renamed old bundle a moment later: sweep once it has
+                // settled, before this process is replaced.
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                service.removeLeftoverRegistrations()
                 await MainActor.run { [weak self] in self?.restartIntoNewVersion() }
             } catch {
                 await MainActor.run { [weak self] in

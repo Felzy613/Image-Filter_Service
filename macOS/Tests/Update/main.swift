@@ -113,6 +113,25 @@ check(!UpdateGate.checkIsDue(lastAttempt: now.addingTimeInterval(-600), lastSucc
 check(UpdateGate.checkIsDue(lastAttempt: now.addingTimeInterval(-UpdateConfig.retryInterval - 1), lastSucceeded: false, now: now), "retry after a failure")
 check(UpdateGate.checkIsDue(lastAttempt: now.addingTimeInterval(3600), lastSucceeded: true, now: now), "a clock set back doesn't freeze updates")
 
+// MARK: - Leftover registrations (the real pluginkit output from the live 1.9.2 -> 1.9.3 update)
+
+let pluginkitOutput = "     FelzyTech.Image-Filter-Service.Extension(1.9.2)\t8D722CE1-757E-4167-A41E-BDF9218ED6BC\t2026-11-10 03:05:04 +0000\t/Applications/.Image-Filter_Service.app.replaced-1794281437/Contents/PlugIns/Image-Filter_Service Extension.appex\n"
+    + "     FelzyTech.Image-Filter-Service.Extension(1.9.3)\tA9045415-E535-450C-83F4-D3454951B840\t2026-11-10 03:30:37 +0000\t/Applications/Image-Filter_Service.app/Contents/PlugIns/Image-Filter_Service Extension.appex\n"
+    + "     FelzyTech.Image-Filter-Service.Extension(1.9.4)\tAAAAAAAA-0000-0000-0000-000000000000\t2026-11-10 04:00:00 +0000\t/Users/me/Library/Application Support/Image-Filter-Service/Updates.noindex/staged/1.9.4/Image-Filter_Service.app/Contents/PlugIns/Image-Filter_Service Extension.appex\n"
+    + "     FelzyTech.Image-Filter-Service.Extension(1.9.4)\tBBBBBBBB-0000-0000-0000-000000000000\t2026-11-10 04:00:00 +0000\t/Users/me/Library/Developer/Xcode/DerivedData/x/Build/Products/Debug/Image-Filter_Service.app/Contents/PlugIns/Image-Filter_Service Extension.appex\n"
+let owned = ["/Applications/.Image-Filter_Service.app.replaced-", "/Users/me/Library/Application Support/Image-Filter-Service/Updates.noindex/"]
+let strays = UpdateRegistrations.strayAppexPaths(pluginkitOutput: pluginkitOutput, ownedPrefixes: owned)
+check(strays.count == 2, "exactly the two leftover copies are found, got \(strays.count)")
+check(strays.contains { $0.hasPrefix("/Applications/.Image-Filter_Service.app.replaced-1794281437/") }, "the hidden leftover is found")
+check(strays.contains { $0.contains("/Updates.noindex/staged/1.9.4/") }, "a copy left in the updater's own folder is found")
+check(!strays.contains { $0.hasPrefix("/Applications/Image-Filter_Service.app/") }, "the installed app is NEVER a stray")
+check(!strays.contains { $0.contains("DerivedData") }, "another copy (a dev build) is NEVER touched")
+check(UpdateRegistrations.strayAppexPaths(pluginkitOutput: "", ownedPrefixes: owned).isEmpty, "empty output gives nothing")
+check(UpdateRegistrations.strayAppexPaths(pluginkitOutput: "garbage line without tabs\n", ownedPrefixes: owned).isEmpty, "malformed output gives nothing")
+check(UpdateRegistrations.strayAppexPaths(pluginkitOutput: pluginkitOutput, ownedPrefixes: []).isEmpty, "no owned prefixes -> nothing is ever unregistered")
+check(UpdateRegistrations.appPath(containing: strays[0]) == "/Applications/.Image-Filter_Service.app.replaced-1794281437", "app path derived from the extension path")
+check(UpdateRegistrations.appPath(containing: "/x/y.appex") == nil, "a path that is not inside Contents/PlugIns has no app path")
+
 // MARK: - Envelope (signature)
 
 func envelope(_ scenario: String) -> Data { try! Data(contentsOf: URL(fileURLWithPath: env["IFS_TEST_SRV"]!).appendingPathComponent("\(scenario)/update.json")) }
@@ -255,6 +274,24 @@ for forceFallback in [false, true] {
     check(visible.allSatisfy { $0.hasPrefix(".") && !$0.hasSuffix(".app") },
           "\(label): anything left next to the app is hidden and not an .app: \(visible)")
     print("note: \(label): left next to the app: \(visible.isEmpty ? "nothing" : visible.joined(separator: ", ")); in Updates folder: \(((try? fm.contentsOfDirectory(atPath: dir.appendingPathComponent("root/staged").path)) ?? []).joined(separator: ","))")
+}
+
+// A user-owned old bundle with a read-only folder inside (the interim guard on a live Mac): the atomic
+// exchange still works and the old copy is deleted completely, not left behind.
+do {
+    let (svc, installed, dir) = makeService("ok")
+    let guarded = installed.appendingPathComponent("Contents/Resources")
+    try! fm.createDirectory(at: guarded, withIntermediateDirectories: true)
+    try! Data("x".utf8).write(to: guarded.appendingPathComponent("data.txt"))
+    let chmod = Process()
+    chmod.executableURL = URL(fileURLWithPath: "/bin/chmod"); chmod.arguments = ["a-w", guarded.path]
+    try! chmod.run(); chmod.waitUntilExit()
+    _ = try? await svc.checkAndStage()
+    do { _ = try svc.installPending() } catch { check(false, "guarded old: install failed: \(error)") }
+    check(installedVersion(installed) == "1.0.1", "guarded old: new version in place")
+    let apps = installed.deletingLastPathComponent().path
+    check(((try? fm.contentsOfDirectory(atPath: apps)) ?? []).filter { $0 != "IFSTest.app" }.isEmpty, "guarded old: nothing left beside the app")
+    check(!fm.fileExists(atPath: dir.appendingPathComponent("root/staged/1.0.1").path), "guarded old: the old copy was deleted from the updates folder too")
 }
 
 // Rollback: a failure after the swap restores the old app and counts the attempt.

@@ -110,6 +110,10 @@ python3 "$OUT/server.py" "$SRV" "$OUT/port" & SERVER_PID=$!
 for _ in $(seq 1 50); do [ -s "$OUT/port" ] && break; sleep 0.1; done
 [ -s "$OUT/port" ] || { echo "local test server did not start"; exit 1; }
 
+# The server must keep Python's bytecode out of the app bundle (see start_server.py).
+grep -q "PYTHONPYCACHEPREFIX" server/start_server.py \
+    || { echo "FAIL: server/start_server.py no longer sets PYTHONPYCACHEPREFIX (a user-owned bundle would get __pycache__ and a broken signature)"; exit 1; }
+
 # The CI "verify" step must accept the good file and refuse the bad ones.
 "$SIGN" verify "$SRV/ok/update.json" --public-key "$PUB" --asset "$SRV/ok/cdn/IFSTest-1.0.1.zip" >/dev/null \
     || { echo "FAIL: sign_update verify rejected a good manifest"; exit 1; }
