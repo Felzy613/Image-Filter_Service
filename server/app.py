@@ -43,6 +43,15 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8MB
 SKIN_RATIO_THRESHOLD = float(os.getenv("SKIN_RATIO_THRESHOLD", "0.001"))
 SKIN_OVERLAY_ALPHA = float(os.getenv("SKIN_OVERLAY_ALPHA", "1.0"))
 REQUEST_TIMEOUT = int(os.getenv("IMAGE_FETCH_TIMEOUT", "10"))
+# URL downloads are the last resort and the only thing here that can block for long: the
+# timeout is per connection attempt, so an unreachable host with several addresses held a
+# thread for 80 s (measured). Gunicorn has 8 threads; if downloads fill them all, `GET /`
+# (the extension's and the watcher's health check) and real images queue behind them and the
+# filter looks dead. So downloads may hold at most FETCH_CONCURRENCY threads; extra ones fail
+# at once (the usual fail-closed error, the content script retries) and the rest stay free.
+FETCH_CONCURRENCY = max(1, int(os.getenv("IMAGE_FETCH_CONCURRENCY", "3")))
+FETCH_CONNECT_TIMEOUT = min(3, REQUEST_TIMEOUT)
+_fetch_slots = threading.BoundedSemaphore(FETCH_CONCURRENCY)
 
 MODEL_URL = os.getenv(
     "SEGMENTATION_MODEL_URL",
@@ -396,7 +405,13 @@ def load_image(image_data: Optional[str], image_url: Optional[str]) -> Image.Ima
             img = _open_bytes(_decode_data_url(image_url))
         else:
             # Normally the extension sends pixels; this is the last resort.
-            response = _http.get(image_url, timeout=REQUEST_TIMEOUT, verify=certifi.where())
+            if not _fetch_slots.acquire(blocking=False):
+                raise RuntimeError("Too many image downloads in progress; try again shortly")
+            try:
+                response = _http.get(image_url, timeout=(FETCH_CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+                                     verify=certifi.where())
+            finally:
+                _fetch_slots.release()
             response.raise_for_status()
             if len(response.content) > MAX_IMAGE_BYTES:
                 raise ValueError("Image payload too large")

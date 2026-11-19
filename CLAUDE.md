@@ -88,6 +88,7 @@ The Mac app updates itself from this repo's GitHub Releases, **silently**: no wi
 - `SKIN_RATIO_THRESHOLD` defaults to `0.001` (0.1% skin pixels triggers filtering).
 - Errors return `success: true` + `error` so the page isn't broken; `background.js` treats any `error` as **fail closed** (`fallback: true` → image stays hidden, content.js retries with backoff). Before this, such responses were passed on as "no skin" and the image was revealed unchecked.
 - URL downloads (last resort — see background fetch below) apply EXIF orientation, so photos come back upright, and use a keep-alive `requests.Session`.
+- **Downloads can't starve the server (found 2026-11-18: popup said "Filter not running" while gunicorn was up).** The download timeout is per connection attempt, so a host that can't be reached ("No route to host") with several addresses held a thread up to 80 s (log: `POST error 80013ms … ssl.gstatic.com`); a few such URL-only requests filled all 8 threads, `HEAD /` (the extension's check, 2 s limit; the watcher's, 1 s) and real images queued behind them, and the status card turned red. `load_image` now takes a slot from `_fetch_slots` (`IMAGE_FETCH_CONCURRENCY`, 3) without waiting: when none is free the request fails at once with the normal `error` reply (fail closed, `content.js` retries with back-off), connect timeout 3 s. Reproduced with a local tarpit (8 URL-only requests: health check timed out, a real image waited 5 s+) and re-measured after: health 200 in <10 ms, real image 20 ms, even with 30 slow downloads at once. The 5 left over simply fail fast. Diagnose a "not running" report by looking for long `POST error …ms` lines in `~/Library/Logs/Image-Filter-Service/server.log` and for `Handling signal: term` in `server_error.log` (that one is only the watcher stopping the server when Safari closes).
 
 ### iOS (iPhone / iPad)
 
@@ -170,7 +171,8 @@ After a rebuild, quit and reopen Safari to pick up extension changes.
 | `PORT` | `10000` | Server listen port |
 | `SKIN_RATIO_THRESHOLD` | `0.001` | Minimum skin pixel ratio to trigger filtering |
 | `SKIN_OVERLAY_ALPHA` | `1.0` | Overlay opacity (1.0 = fully grey) |
-| `IMAGE_FETCH_TIMEOUT` | `10` | HTTP timeout when server downloads images |
+| `IMAGE_FETCH_TIMEOUT` | `10` | HTTP read timeout when server downloads images (connect timeout is 3 s) |
+| `IMAGE_FETCH_CONCURRENCY` | `3` | Most gunicorn threads (of 8) URL downloads may hold at once; extra downloads fail immediately (fail closed, retried by the content script) |
 | `SEG_INTERPRETERS` | `2` | TFLite interpreters (~80 MB each); 3 ≈ 10% slower than the old 1 GB setup under load |
 | `SEG_INTERPRETER_THREADS` | `min(4, (CPUs − 2) ÷ interpreters)` | XNNPACK threads per interpreter |
 | `SKIN_PROB_THRESHOLD` | `0.3` | P(body-skin)+P(face-skin) above which a pixel is greyed |
