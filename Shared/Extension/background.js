@@ -475,8 +475,9 @@
     // live: a video frame — never waits for a server that is starting (a later frame will do).
     // serverDownloads: no pixels, the server downloads imageUrl itself (see _filterOnServer).
     async function _fetchFromServer(imageUrl, imageData, { live = false, serverDownloads = false } = {}) {
-        // The server used to receive requests with nothing in them and fail them ("No image
-        // data or URL provided"); the picture then stayed hidden for good.
+        // Nothing to check: fail closed here instead of sending the server an empty request.
+        // (The "No image data or URL provided" lines in server.log are not pictures: they are
+        // checkServer's HEAD request, which Flask hands to the POST branch.)
         if (!imageData && !(serverDownloads && /^https?:/i.test(imageUrl || ''))) {
             return failClosed('No pixels to check');
         }
