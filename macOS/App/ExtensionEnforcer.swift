@@ -28,14 +28,17 @@ enum SafariFamily {
 
 #if DEBUG
 /// Test hooks, compiled into Debug builds only, so tests never have to touch a real Safari
-/// session. Both are independent:
+/// session. All are independent:
 ///   IFS_ENFORCER_TARGET=<bundle id>   close this app (e.g. Calculator) instead of Safari;
 ///                                     "Turn On" then doesn't open Safari Settings
 ///   IFS_ENFORCER_STATE_FILE=<path>    read the extension state (on, off, unknown) from this
 ///                                     file instead of asking Safari
+///   IFS_ENFORCER_SAFARI_DIR=<path>    read Safari's settings (SafariTabs.db, Extensions.plist)
+///                                     from this folder instead of Safari's container
 enum EnforcerTestMode {
     static let targetBundleID = ProcessInfo.processInfo.environment["IFS_ENFORCER_TARGET"]
     static let stateFile = ProcessInfo.processInfo.environment["IFS_ENFORCER_STATE_FILE"]
+    static let safariDir = ProcessInfo.processInfo.environment["IFS_ENFORCER_SAFARI_DIR"]
 
     static func readStateFile(_ path: String) -> ExtensionGate.Reading {
         let text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
@@ -58,11 +61,22 @@ final class ExtensionEnforcer: NSObject {
 
     private var gate = ExtensionGate()
     private var lastReading: ExtensionGate.Reading?
+    private var lastSettings: ExtensionGate.SettingsReading?
     private var lastFailure: String?
     private var timer: Timer?
     private var readInFlight = false
     private var quitRequested = Set<pid_t>()
     private let notice = EnforcementNotice()
+    /// Safari's own per-profile settings: the state API takes no profile (see SafariProfileSettings).
+    private let settings: SafariProfileSettings = {
+        var path = SafariProfileSettings.safariDataPathForCurrentUser
+        #if DEBUG
+        if let dir = EnforcerTestMode.safariDir { path = dir }
+        #endif
+        return SafariProfileSettings(safariDataPath: path,
+                                     extensionKey: "\(extensionBundleIdentifier) (\(UpdateConfig.teamID))")
+    }()
+    private let settingsQueue = DispatchQueue(label: "FelzyTech.Image-Filter-Service.safari-settings", qos: .utility)
 
     func start() {
         let nc = NSWorkspace.shared.notificationCenter
@@ -70,7 +84,7 @@ final class ExtensionEnforcer: NSObject {
                        name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         nc.addObserver(self, selector: #selector(appsChanged(_:)),
                        name: NSWorkspace.didTerminateApplicationNotification, object: nil)
-        notice.onTurnOn = { [weak self] in self?.beginSetup() }
+        notice.onButton = { [weak self] in self?.noticeButtonTapped() }
         logger.info("Extension enforcer started")
         updatePolling()
     }
@@ -136,8 +150,17 @@ final class ExtensionEnforcer: NSObject {
     }
 
     private func finishPoll(_ reading: ExtensionGate.Reading) {
-        readInFlight = false
-        apply(reading)
+        // Off the main queue: a few small files and a read-only SQLite query (~0.4 ms measured),
+        // but SQLite may wait up to 200 ms if Safari is writing.
+        let reader = settings   // a plain value, so the background closure doesn't touch self
+        settingsQueue.async { [weak self] in
+            let found = reader.read()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.readInFlight = false
+                self.apply(reading, settings: found)
+            }
+        }
     }
 
     /// Delivers exactly one reading on the main queue, even if Safari never answers.
@@ -186,18 +209,19 @@ final class ExtensionEnforcer: NSObject {
 
     // MARK: - Acting on it
 
-    private func apply(_ reading: ExtensionGate.Reading) {
+    private func apply(_ reading: ExtensionGate.Reading, settings: ExtensionGate.SettingsReading) {
         let before = gate.blockReason
-        gate.record(reading)
+        gate.record(reading, settings: settings)
         let now = Date()
 
         // Log meaningful changes only: a healthy session writes one line, not one per second.
-        // A single unreadable reading is noise (see poll()); log it only once it persists.
+        // A single unreadable API reading is noise (see poll()); log it only once it persists.
         let changedState = reading != .unknown && reading != lastReading
-        let unreadableForAWhile = reading == .unknown && gate.notOnStreak == 5
-        if changedState || unreadableForAWhile || gate.blockReason != before {
+        let unreadableForAWhile = gate.notOnStreak == 5
+        if changedState || settings != lastSettings || unreadableForAWhile || gate.blockReason != before {
             if reading != .unknown { lastReading = reading }
-            logger.info("Extension state: \(String(describing: reading), privacy: .public) — blocking: \(String(describing: self.gate.blockReason), privacy: .public)")
+            lastSettings = settings
+            logger.info("Extension state: \(String(describing: reading), privacy: .public), Safari settings: \(String(describing: settings), privacy: .public) — blocking: \(String(describing: self.gate.blockReason), privacy: .public)")
         }
 
         guard let reason = gate.blockReason else {
@@ -225,6 +249,23 @@ final class ExtensionEnforcer: NSObject {
                 }
                 self?.quitRequested.remove(pid)
             }
+        }
+    }
+
+    private func noticeButtonTapped() {
+        if gate.blockReason == .unverifiable(.noFileAccess) {
+            openFullDiskAccessSettings()
+        } else {
+            beginSetup()
+        }
+    }
+
+    /// Full Disk Access can't be asked for (no prompt exists for it); the person has to switch it on
+    /// in System Settings, so open that list for them.
+    private func openFullDiskAccessSettings() {
+        logger.info("Opening Full Disk Access settings")
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -264,7 +305,7 @@ final class EnforcementNotice: NSObject {
         case setup(remaining: TimeInterval)
     }
 
-    var onTurnOn: (() -> Void)?
+    var onButton: (() -> Void)?
 
     private var panel: NSPanel?
     private let titleLabel = NSTextField(labelWithString: "")
@@ -276,18 +317,23 @@ final class EnforcementNotice: NSObject {
         self.panel = panel
 
         switch content {
-        case .blocked(.off):
+        case .blocked(.off(let problems)):
             titleLabel.stringValue = "Safari was closed"
-            bodyLabel.stringValue = "The Image Filter Service extension is turned off, so Safari can’t be used. Turn it back on to continue."
-            button.title = "Turn On in Safari Settings…"
+            bodyLabel.stringValue = Self.describe(problems)
+                + " Safari can’t be used until this is fixed in Safari Settings."
+            button.title = "Fix in Safari Settings…"
+        case .blocked(.unverifiable(.noFileAccess)):
+            titleLabel.stringValue = "Safari was closed"
+            bodyLabel.stringValue = "Image Filter Service needs Full Disk Access to check that its Safari extension is on in every Safari profile you use. macOS keeps Safari’s settings private, and this is the only way to read them. Safari can’t be used until it has access. In the list, switch on Image-Filter_Service (if it isn’t there, add it with + from the Applications folder), then open Safari again."
+            button.title = "Open Full Disk Access Settings…"
         case .blocked(.unverifiable):
             titleLabel.stringValue = "Safari was closed"
-            bodyLabel.stringValue = "Image Filter Service can’t confirm that its Safari extension is on, so Safari can’t be used. Open Safari Settings and check that it is turned on."
+            bodyLabel.stringValue = "Image Filter Service can’t confirm that its Safari extension is on, so Safari can’t be used. Open Safari Settings and check that it is turned on and allowed on all websites."
             button.title = "Open Safari Settings…"
         case .setup(let remaining):
             let seconds = Int(remaining.rounded(.up))
             titleLabel.stringValue = "Turn on the extension"
-            bodyLabel.stringValue = "In Safari Settings, open Extensions and turn on Image Filter Service. Safari closes again in \(seconds / 60):\(String(format: "%02d", seconds % 60)) if it is still off."
+            bodyLabel.stringValue = "In Safari Settings, turn on Image Filter Service in every profile you use, allow it on all websites and in Private Browsing. Safari closes again in \(seconds / 60):\(String(format: "%02d", seconds % 60)) if it is still not fixed."
             button.title = "Open Safari Settings Again"
         }
 
@@ -310,8 +356,27 @@ final class EnforcementNotice: NSObject {
         panel?.orderOut(nil)
     }
 
-    @objc private func turnOnTapped() {
-        onTurnOn?()
+    /// One sentence per problem, e.g. "The extension is turned off in the “Mike” profile."
+    static func describe(_ problems: [ExtensionGate.Problem]) -> String {
+        let sentences = problems.map { problem -> String in
+            switch problem {
+            case .stateAPIOff:
+                return "The Image Filter Service extension is turned off."
+            case .turnedOff(let profile):
+                return "The Image Filter Service extension is turned off in the “\(profile)” profile."
+            case .notAllWebsites(let profile):
+                return "In the “\(profile)” profile, the extension isn’t allowed on all websites."
+            case .notInPrivateBrowsing:
+                return "The extension isn’t allowed in Private Browsing."
+            }
+        }
+        var unique: [String] = []
+        for sentence in sentences where !unique.contains(sentence) { unique.append(sentence) }
+        return unique.isEmpty ? "The Image Filter Service extension is turned off." : unique.joined(separator: " ")
+    }
+
+    @objc private func buttonTapped() {
+        onButton?()
     }
 
     private func makePanel() -> NSPanel {
@@ -335,7 +400,7 @@ final class EnforcementNotice: NSObject {
         button.bezelStyle = .rounded
         button.keyEquivalent = "\r"
         button.target = self
-        button.action = #selector(turnOnTapped)
+        button.action = #selector(buttonTapped)
 
         let text = NSStackView(views: [titleLabel, bodyLabel, button])
         text.orientation = .vertical
