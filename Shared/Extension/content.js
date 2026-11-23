@@ -29,7 +29,6 @@
 
     // Configuration
     const config = {
-        serverUrl: 'http://127.0.0.1:10000/api/filter-image',
         isEnabled: true, // loaded from storage below; start optimistically enabled
         enableLogging: true,
         processedAttribute: 'data-filter-processed',
@@ -62,13 +61,12 @@
 
     // Queue to handle images being processed
     const processingQueue = new Set();
-    const MAX_CONCURRENT = 10; // Limit concurrent requests - server now has multi-threading
-    const MAX_CONCURRENT_DEVICE = 4;
+    // The engine checks one image at a time; more in flight only means more decoded copies held
+    // in memory (iOS limits it), not faster results.
+    const MAX_CONCURRENT = 4;
 
-    // Canvas encoding size bounds.
-    // Min ensures MediaPipe always gets enough pixels for reliable detection.
-    // Max caps memory/bandwidth. The actual size is driven by the element's
-    // rendered display size (see encodeImageToJpeg).
+    // Output size bounds for a filtered picture (paintFilteredImage): the element's rendered
+    // display size × devicePixelRatio, at least MIN_ENCODE_DIM, at most MAX_ENCODE_DIM.
     const MIN_ENCODE_DIM = 320;
     const MAX_ENCODE_DIM = 1280;
     
@@ -212,25 +210,6 @@
         return true;
     }
     
-    // Encode an already-loaded img element to a JPEG data URL.
-    // Target size = the element's rendered display size × devicePixelRatio, so
-    // thumbnails stay small/fast while large displayed images encode at full display
-    // quality. Bounds: MIN_ENCODE_DIM (good enough for detection) .. MAX_ENCODE_DIM.
-    // White background handles transparent pixels — server converts to RGB anyway.
-    // Server engine sends at least 512px (when the image has it): the server segments
-    // overlapping tiles, so extra pixels let it find small people in thumbnails
-    // (measured: group shots 93% → 96% of skin covered, ~2 ms more per image).
-    const SERVER_MIN_ENCODE_DIM = 512;
-    function encodeImageToJpeg(img, displayHint) {
-        const { w, h } = outputSize(img, displayHint, SERVER_MIN_ENCODE_DIM);
-        const canvas = drawToCanvas(img, w, h);
-        try {
-            return canvas.toDataURL('image/jpeg', 0.85);
-        } finally {
-            releaseCanvas(canvas);
-        }
-    }
-
     // Free a canvas's memory now (iOS caps a page's total canvas memory; see content-core.js).
     function releaseCanvas(canvas) {
         canvas.width = 0;
@@ -274,20 +253,17 @@
         return canvas;
     }
 
-    // --- On-device engine (iPhone/iPad) -----------------------------------------
-    // The background page filters with MediaPipe on the device itself, with the server's
-    // tiled detection (ondevice/engine.js): it gets a ≤768px copy — small people need the
-    // pixels — and returns the skin mask; the grey is painted here at full resolution from the image we already
-    // decoded. So the common case — no skin — costs one tiny JPEG encode on this page
-    // instead of a display-size one, and nothing large crosses to the background.
+    // --- The filter engine ---------------------------------------------------------
+    // The background page filters with MediaPipe in WebAssembly (ondevice/engine.js: the whole
+    // picture plus overlapping tiles): it gets a ≤768px copy — small people need the pixels — and
+    // returns the skin mask; the grey is painted here at full resolution from the image we
+    // already decoded. So the common case — no skin — costs one small JPEG encode on this page,
+    // and nothing large crosses to the background.
     const SEG_MAX = 768;  // keep in sync with ondevice/engine.js (tiled detection needs the pixels)
 
-    // Which engine the background uses ('server' | 'device'). Asking also wakes the
-    // background page, which starts loading the on-device engine before our images arrive.
-    let engine = null;
-    const engineReady = browser.runtime.sendMessage({ action: 'getConfig' })
-        .then(cfg => { engine = (cfg && cfg.engine) || 'server'; })
-        .catch(() => { engine = 'server'; });
+    // Asking for the config wakes the background page, which starts loading the engine before
+    // our images arrive.
+    const engineReady = browser.runtime.sendMessage({ action: 'getConfig' }).catch(() => {});
 
     // Load with CORS so the pixels are readable; rejects if the site doesn't allow it
     // (the background page then downloads the image itself).
@@ -305,7 +281,7 @@
         return image;
     }
 
-    // Same maths as server/app.py apply_grey_overlay() and ondevice/engine.js paintOverlay():
+    // Same maths as ondevice/engine.js paintOverlay():
     // the mask (run-length encoded, alternating not-skin/skin runs) becomes grey pixels with
     // alpha; drawImage's bilinear upscale + source-over blend gives (1 − a)·image + a·grey.
     function paintFilteredImage(image, mask, displayHint) {
@@ -380,32 +356,6 @@
         return { response, image };
     }
 
-    // Encode an image URL to a JPEG data URL for the server.
-    // displayHint: {w, h} of the page <img> element's CSS display size, used to
-    // choose an appropriate encoding resolution (see encodeImageToJpeg).
-    //  - Fast path: the page already downloaded and decoded this exact image; if its
-    //    pixels are readable (same-origin or CORS), encode that — no second download.
-    //  - Otherwise load a CORS copy. If the site doesn't allow CORS this rejects and the
-    //    background page fetches the image itself (a non-CORS copy would only taint the
-    //    canvas, so it isn't worth downloading).
-    //  - blob: URLs belong to this page, so they go through the canvas too (the server
-    //    can't open them).
-    //  - data: URLs as well. They used to be passed on as they were, but the server only
-    //    reads base64 raster images: an SVG (data:image/svg+xml,<svg… or ;base64) failed on
-    //    every attempt ("Incorrect padding", "cannot identify image file": ~1,100 of them in
-    //    the server log), so the picture — typically a toolbar or menu icon — never appeared,
-    //    with the server running. A data: URL is always readable, so the canvas works.
-    async function downloadImageAsBase64(url, displayHint, pageImg) {
-        if (pageImg && pageImg.complete && pageImg.naturalWidth > 0 &&
-            (pageImg.currentSrc || pageImg.src) === url) {
-            try {
-                return encodeImageToJpeg(pageImg, displayHint);
-            } catch {
-                // Cross-origin without CORS (tainted canvas) — try a CORS copy below.
-            }
-        }
-        return encodeImageToJpeg(await loadReadableImage(url), displayHint);
-    }
     
     // Function to process a single image
     async function processImage(img) {
@@ -424,13 +374,11 @@
         }
         if (!src) return;
 
-        // On-device the engine checks one image at a time; more in flight only means more
-        // decoded copies held in memory (iOS limits it). The server works in parallel.
-        if (processingQueue.size >= (engine === 'device' ? MAX_CONCURRENT_DEVICE : MAX_CONCURRENT)) {
+        if (processingQueue.size >= MAX_CONCURRENT) {
             return; // Will be picked up on next scan
         }
 
-        // Check URL cache before any server work
+        // Check URL cache before any work
         if (imageCache.has(src)) {
             const entry = imageCache.get(src);
             if (Date.now() - entry.ts < CACHE_TTL) {
@@ -465,28 +413,7 @@
             // clientWidth/clientHeight are the CSS layout pixels (pre-DPR).
             const displayHint = { w: img.clientWidth || 0, h: img.clientHeight || 0 };
 
-            if (engine === 'device') {
-                ({ response, image } = await requestOnDevice(src, img));
-            } else {
-                let imageData = null;
-                try {
-                    imageData = await downloadImageAsBase64(src, displayHint, img);
-                } catch (downloadError) {
-                    log('Pixels not readable here; background will fetch the image:', downloadError.message);
-                }
-
-                response = await browser.runtime.sendMessage({
-                    action: 'filterImage',
-                    imageUrl: src,       // Always send original URL — used as cache key in background
-                    imageData: imageData,
-                    // Size to encode at if the background has to fetch the image itself.
-                    maxDim: encodeMaxDim(displayHint, SERVER_MIN_ENCODE_DIM),
-                    dimensions: {
-                        width: img.naturalWidth || img.width,
-                        height: img.naturalHeight || img.height
-                    }
-                });
-            }
+            ({ response, image } = await requestOnDevice(src, img));
 
             // The page changed this image while we were checking it: a newer round owns it.
             if (!isCurrent(img, round)) return;
@@ -499,14 +426,15 @@
                     revealWhenShowing(img, src, round);
                     log('No skin, revealing original:', src);
                 } else if (response.mask && image) {
-                    // Skin found on-device — paint the grey here at display resolution.
+                    // Skin found — paint the grey here at display resolution.
                     const filteredUrl = await paintFilteredImage(image, response.mask, displayHint);
                     if (!isCurrent(img, round)) return;  // changed while encoding
                     imageCache.set(src, { filteredUrl, ts: Date.now() });
                     revealWhenShowing(img, filteredUrl, round);
-                    log('Skin filtered on-device:', src);
+                    log('Skin filtered:', src);
                 } else if (response.filteredImageUrl) {
-                    // Skin found — show the filtered version.
+                    // Skin found in a picture the background had to download itself (this page
+                    // couldn't read its pixels): show the filtered version it made.
                     imageCache.set(src, { filteredUrl: response.filteredImageUrl, ts: Date.now() });
                     revealWhenShowing(img, response.filteredImageUrl, round);
                     log('Skin filtered:', src);
@@ -515,14 +443,14 @@
                     img.setAttribute(config.processedAttribute, 'failed');
                 }
             } else {
-                // Server error or unavailable — keep image hidden for religious compliance.
-                // Do NOT cache: allow retry on next scan.
-                log('Filter failed (server error or unavailable):', response?.error || 'unknown');
+                // The check failed (engine not loaded, picture unreadable) — keep the image
+                // hidden for religious compliance. Do NOT cache: allow retry on next scan.
+                log('Filter failed:', response?.error || 'unknown');
                 img.setAttribute(config.processedAttribute, 'failed');
             }
 
         } catch (error) {
-            log('Error processing image (server may be unavailable):', error);
+            log('Error processing image:', error);
             if (isCurrent(img, round)) img.setAttribute(config.processedAttribute, 'failed');
         } finally {
             processingQueue.delete(src);
@@ -771,10 +699,9 @@
         return reset;
     }
 
-    // Self-healing retry. The background page's "serverOnline" push (below) is only
-    // reliable on macOS — Safari on iOS suspends the background page, and a hosted server
-    // can cold-start for a minute — so also retry on our own, backing off while the
-    // server stays unreachable (5s → 60s) so a dead server isn't hammered.
+    // Self-healing retry: failed images are checked again, backing off while they keep failing
+    // (5 s → 60 s). The background's "filterReady" push (below) resets that the moment the
+    // engine loads after failing to.
     const RETRY_MIN_MS = 5000;
     const RETRY_MAX_MS = 60000;
     let retryDelay = RETRY_MIN_MS;
@@ -792,22 +719,6 @@
     // Listen for messages from background script
     browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (request.action === 'updateConfig') {
-            if (request.engine && request.engine !== engine) {
-                engine = request.engine;
-                imageCache.clear();
-                retryDelay = RETRY_MIN_MS;
-                requeueFailedImages();
-            }
-            if (request.serverUrl) {
-                const changed = request.serverUrl !== config.serverUrl;
-                config.serverUrl = request.serverUrl;
-                log('Server URL updated to:', config.serverUrl);
-                // New server, new chance: retry anything that failed against the old one.
-                if (changed) {
-                    retryDelay = RETRY_MIN_MS;
-                    requeueFailedImages();
-                }
-            }
             // Respond to enable/disable toggle from the popup (iOS only; the background
             // always reports `true` on the Mac)
             if (request.isEnabled !== undefined) globalEnabled = request.isEnabled !== false;
@@ -815,23 +726,20 @@
             if (request.isEnabled !== undefined || Array.isArray(request.excludedSites)) applyEnabled();
         }
 
-        if (request.action === 'serverOnline') {
-            // Server came back up after a cold start — reset failed images so the
-            // 250ms scan picks them up and reprocesses them.
+        if (request.action === 'filterReady') {
+            // The engine loaded after failing to — reset failed images so the 250ms scan picks
+            // them up and checks them again.
             const reset = requeueFailedImages();
             retryDelay = RETRY_MIN_MS;
-            if (reset > 0) log(`Server online — queued ${reset} failed image(s) for retry`);
+            if (reset > 0) log(`Filter ready — queued ${reset} failed image(s) for retry`);
         }
     });
 
-    // Load the persisted enabled/serverUrl state so the content script starts in
+    // Load the persisted enabled state so the content script starts in
     // the correct mode — especially important if the user previously disabled the
     // extension and then navigates to a new page.
     // Same for excluded websites: on one, everything is revealed as soon as this resolves.
-    browser.storage.local.get(['serverUrl', 'isEnabled', 'excludedSites', 'platform']).then(result => {
-        if (result.serverUrl) {
-            config.serverUrl = result.serverUrl;
-        }
+    browser.storage.local.get(['isEnabled', 'excludedSites', 'platform']).then(result => {
         // Only the iPhone/iPad extension has an off switch. On the Mac a stored "off" (left
         // over from before it was removed) must not count — and an unknown platform fails
         // closed the same way (background.js writes `platform` each time it loads).

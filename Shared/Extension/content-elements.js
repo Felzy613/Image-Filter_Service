@@ -226,7 +226,6 @@
         IFS.releaseCanvas(picture);
         if (r.failed) return { failed: true };
         if (r.clean) return { clean: true };
-        if (r.filteredImageUrl) return { raster: r.filteredImageUrl };
         return { failed: true };
     }
 
@@ -411,14 +410,10 @@
             for (const root of IFS.allRoots()) scanTree(root);
         },
 
-        // The server is back (content-core.js): retry everything that failed, now.
+        // The filter works again (content-core.js): retry everything that failed, now.
         retryNow() {
             for (const [el, r] of retry) retry.set(el, { at: 0, delay: r.delay });
             this.tick();
-        },
-
-        onEngineChange() {
-            svgCache.clear();
         },
 
         setEnabled(on) {

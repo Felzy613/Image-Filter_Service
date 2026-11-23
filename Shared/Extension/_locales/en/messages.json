@@ -4,7 +4,7 @@
         "description": "The display name for the extension."
     },
     "extension_description": {
-        "message": "Automatically filters images containing human skin, providing a kosher browsing experience by sending images to a processing server.",
+        "message": "Automatically filters images containing human skin, providing a kosher browsing experience. Every picture is checked on this device; nothing is sent anywhere.",
         "description": "Description of what the extension does."
     }
 }

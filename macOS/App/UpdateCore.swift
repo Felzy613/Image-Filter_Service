@@ -263,8 +263,8 @@ nonisolated enum UpdateGate {
     /// An update is installed only while no Safari window or Safari web app is open, so the filter
     /// is never swapped out from under a page that is being shown. It is queued until Safari has
     /// been closed (and so restarts on the new version).
-    static func canInstallNow(safariRunning: Bool, serverSetupRunning: Bool) -> Bool {
-        !safariRunning && !serverSetupRunning
+    static func canInstallNow(safariRunning: Bool) -> Bool {
+        !safariRunning
     }
 
     static func checkIsDue(lastAttempt: Date?, lastSucceeded: Bool, now: Date) -> Bool {

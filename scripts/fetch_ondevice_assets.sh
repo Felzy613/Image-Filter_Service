@@ -1,22 +1,22 @@
 #!/bin/bash
-# Re-create the iOS extension's on-device filtering assets from their official sources
+# Re-create the extension's on-device filtering assets (macOS and iOS) from their official sources
 # (pinned versions, checksum-verified):
 #   - MediaPipe Tasks Vision web runtime (npm @mediapipe/tasks-vision)
-#   - the selfie_multiclass_256x256 segmentation model the server also uses
+#   - the selfie_multiclass_256x256 segmentation model
 #
 # Usage: scripts/fetch_ondevice_assets.sh [output-dir]
-#        (default: "iOS/Extension/ondevice")
+#        (default: "Shared/Extension/ondevice", shipped in both the macOS and iOS extensions)
 #
-# To upgrade MediaPipe: change VERSION, run with VERIFY=0, test in the iOS Simulator,
+# To upgrade MediaPipe: change VERSION, run with VERIFY=0, test in Safari (Mac) and the iOS Simulator,
 # then paste the new checksums below.
 set -euo pipefail
 
-VERSION="0.10.32"   # keep in step with mediapipe in server/requirements.txt
+VERSION="0.10.32"
 MODEL_URL="https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite"
 VERIFY="${VERIFY:-1}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${1:-$ROOT/iOS/Extension/ondevice}"
+OUT="${1:-$ROOT/Shared/Extension/ondevice}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 

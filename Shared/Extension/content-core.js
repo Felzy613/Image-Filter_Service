@@ -330,28 +330,21 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     IFS.isCurrent = (el, round, key = '') => (rounds.get(el)?.get(key) || 0) === round;
 
     // --- Engine --------------------------------------------------------------------------
-    IFS.engine = null;
-    IFS.engineReady = browser.runtime.sendMessage({ action: 'getConfig' })
-        .then(cfg => { IFS.engine = (cfg && cfg.engine) || 'server'; })
-        .catch(() => { IFS.engine = 'server'; });
+    // Pictures are checked by the engine in the background page (ondevice/engine.js). Asking for
+    // the config also wakes that page, which starts loading the engine before our images arrive.
+    IFS.engineReady = browser.runtime.sendMessage({ action: 'getConfig' }).catch(() => {});
     browser.runtime.onMessage.addListener(request => {
-        if (request.action === 'updateConfig' && request.engine && request.engine !== IFS.engine) {
-            IFS.engine = request.engine;
-            pictureCache.clear();
-            for (const m of modules) if (m.onEngineChange) m.onEngineChange();
-        }
-        // The server is reachable again (background.js): everything that failed while it was
-        // down or overloaded is checked again now. Without this, inline SVGs, CSS pictures and
+        // The engine works again after failing to load (background.js): everything that failed
+        // meanwhile is checked again now. Without this, inline SVGs, CSS pictures and
         // <object>/<embed> waited out their own back-off (up to 60 s) — a toolbar of icons stayed
-        // blank for up to a minute after the server was back. (content.js handles <img>.)
-        if (request.action === 'serverOnline' && IFS.enabled) {
+        // blank for up to a minute after the filter was back. (content.js handles <img>.)
+        if (request.action === 'filterReady' && IFS.enabled) {
             for (const m of modules) if (m.retryNow) m.retryNow();
         }
     });
 
-    const SEG_MAX = 768;           // on-device input: tiled detection needs the pixels (ondevice/engine.js)
+    const SEG_MAX = 768;           // engine input: tiled detection needs the pixels (ondevice/engine.js)
     const MIN_OUT = 320;
-    const SERVER_MIN = 512;        // server segments tiles; more pixels find small people
     const OUTPUT_MAX = 1280;
 
     IFS.fit = function (w, h, max) {
@@ -382,7 +375,7 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
         return canvas;
     };
 
-    // Same maths as server/app.py apply_grey_overlay(): the run-length mask (alternating
+    // Same maths as ondevice/engine.js paintOverlay(): the run-length mask (alternating
     // not-skin/skin) becomes grey pixels; drawImage's bilinear upscale + source-over blend.
     IFS.paintMask = function (ctx, mask, w, h) {
         const maskCanvas = document.createElement('canvas');
@@ -488,7 +481,7 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     let active = 0;
     const waiting = [];
     async function limited(task) {
-        if (active >= (IFS.engine === 'device' ? 3 : 6)) await new Promise(resolve => waiting.push(resolve));
+        if (active >= 3) await new Promise(resolve => waiting.push(resolve));
         active++;
         try {
             return await task();
@@ -535,12 +528,11 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
 
     async function checkUrlNow(url, maxOut) {
         await IFS.engineReady;
-        const device = IFS.engine === 'device';
         let image = null, imageData = null;
         try {
             image = await IFS.loadImage(url);
             const { w, h } = IFS.sizeOf(image);
-            const size = IFS.fit(w, h, device ? SEG_MAX : Math.min(Math.max(maxOut, SERVER_MIN), OUTPUT_MAX));
+            const size = IFS.fit(w, h, SEG_MAX);
             const encode = IFS.drawToCanvas(image, size.w, size.h);
             imageData = encode.toDataURL('image/jpeg', 0.85);
             IFS.releaseCanvas(encode);
@@ -564,26 +556,22 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     }
 
     // Check pixels we drew ourselves (a video frame, a rasterised inline SVG). Never cached
-    // by the background. Resolves to { clean }, { mask } (device), { filteredImageUrl }
-    // (server) or { failed }. Throws if the canvas is tainted (cross-origin video).
-    // mode (on-device engine): 'full' (default, the server's tiling) or 'fast' (video frames:
+    // by the background. Resolves to { clean }, { mask } or { failed }. Throws if the canvas is
+    // tainted (cross-origin video).
+    // mode: 'full' (default: whole picture + overlapping tiles) or 'fast' (video frames:
     // whole frame + frame-height tiles, ~3 passes for 16:9 — see ondevice/engine.js).
-    // 'fast' also tells the background this is a live frame: while the server is starting it
-    // fails at once instead of waiting for it (a later frame will do; content-video.js decides).
     IFS.checkCanvas = async function (canvas, { mode } = {}) {
         if (!canvas.width || !canvas.height) return { failed: true };  // nothing drawn yet
         await IFS.engineReady;
-        const device = IFS.engine === 'device';
-        const size = IFS.fit(canvas.width, canvas.height, device ? SEG_MAX : Math.max(SERVER_MIN, Math.min(canvas.width, OUTPUT_MAX)));
+        const size = IFS.fit(canvas.width, canvas.height, SEG_MAX);
         const small = size.w === canvas.width && size.h === canvas.height
             ? canvas : IFS.drawToCanvas(canvas, size.w, size.h);
-        const imageData = small.toDataURL('image/jpeg', device ? 0.8 : 0.85);
+        const imageData = small.toDataURL('image/jpeg', 0.8);
         if (small !== canvas) IFS.releaseCanvas(small);
-        const response = await send({ action: 'analyzeFrame', imageData, mode, live: mode === 'fast' });
+        const response = await send({ action: 'analyzeFrame', imageData, mode });
         if (!isOk(response)) return { failed: true };
         if (response.filtered === false) return { clean: true };
         if (response.mask) return { mask: response.mask };
-        if (response.filteredImageUrl) return { filteredImageUrl: response.filteredImageUrl };
         return { failed: true };
     };
 

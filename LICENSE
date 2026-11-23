@@ -21,4 +21,4 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 Third-party components bundled in this repository keep their own licenses; see
-iOS/Extension/ondevice/NOTICE.txt (MediaPipe runtime and segmentation model).
+Shared/Extension/ondevice/NOTICE.txt (MediaPipe runtime and segmentation model).

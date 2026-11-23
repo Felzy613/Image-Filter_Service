@@ -4,15 +4,14 @@
   LaunchAgent for Image Filter Service.
 
   This runs a lightweight background WATCHER (accessory mode, no Dock icon,
-  ~0% CPU idle). The watcher subscribes to NSWorkspace notifications and:
-    • starts the heavy server (gunicorn + MediaPipe) when Safari launches
-    • stops that server when Safari quits
-  So the resource-heavy server only runs while Safari is open, but the watcher
-  is always alive to catch every Safari launch reliably.
+  ~0% CPU idle). It keeps the Safari extension switched on (Safari is closed
+  while it is off) and installs updates while Safari is closed. Pictures are
+  filtered inside the extension itself; there is no server. (The label and the
+  --start-server-only argument are from when the watcher also ran a Python
+  filter server; they are kept so existing installs keep working.)
 
   RunAtLoad   — start the watcher at login.
-  KeepAlive   — relaunch the watcher immediately if it ever crashes/quits, so
-                the "start server when Safari opens" guarantee never lapses.
+  KeepAlive   — relaunch the watcher immediately if it ever crashes/quits.
 
   The .pkg installer writes and loads this file automatically.
   For manual installation after copying the .app to /Applications:

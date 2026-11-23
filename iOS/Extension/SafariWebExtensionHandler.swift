@@ -2,10 +2,8 @@
 //  SafariWebExtensionHandler.swift
 //  Image-Filter_Service iOS Extension
 //
-//  iOS counterpart of the macOS handler. An iPhone cannot spawn the Python
-//  filtering server (no subprocesses, no host-app launching), so there is
-//  nothing to start here: the extension talks to a server that is already
-//  reachable over the network. We still answer native messages so a stray
+//  Safari requires a native handler for every web extension. This one has nothing to do: the
+//  extension filters pictures by itself (ondevice/engine.js). It still answers, so a stray
 //  `browser.runtime.sendNativeMessage` never leaves a request hanging.
 //
 

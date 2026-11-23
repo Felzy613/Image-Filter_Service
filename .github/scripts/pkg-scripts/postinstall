@@ -1,7 +1,7 @@
 #!/bin/bash
 # postinstall — runs as root after the .app is copied to /Applications.
 # Creates user-level directories and installs the LaunchAgent so the
-# filter server starts automatically at login.
+# background watcher (extension enforcement, self-update) starts at login.
 set -euo pipefail
 
 APP="/Applications/Image-Filter_Service.app"
@@ -30,17 +30,14 @@ sudo -u "$CURRENT_USER" mkdir -p \
 
 # ── Write LaunchAgent ─────────────────────────────────────────────────────────
 # The LaunchAgent runs the host app as a lightweight background WATCHER
-# (accessory mode, no Dock icon, ~0% CPU idle). The watcher starts the heavy
-# server (gunicorn + MediaPipe) when Safari launches and stops it when Safari
-# quits — so the resource-heavy server only runs while Safari is open, while the
-# watcher itself stays alive to catch every Safari launch reliably.
+# (accessory mode, no Dock icon, ~0% CPU idle). It keeps the Safari extension
+# switched on (Safari is closed while it is off) and installs updates while
+# Safari is closed. Pictures are filtered inside the extension itself; there is no
+# server. (The label and the --start-server-only argument are from when the watcher
+# also ran a Python filter server; they are kept so existing installs keep working.)
 #
 #   RunAtLoad — start the watcher at login (and right now, on install).
-#   KeepAlive — relaunch the watcher immediately if it ever crashes/quits, so the
-#               "start the server when Safari opens" guarantee never lapses. The
-#               watcher only starts the server when Safari is actually running
-#               (enforced in Swift), so KeepAlive does NOT mean the server runs
-#               while Safari is closed.
+#   KeepAlive — relaunch the watcher immediately if it ever crashes/quits.
 sudo -u "$CURRENT_USER" tee "$PLIST" > /dev/null << PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -96,25 +93,23 @@ done || true
 # previous version left running, then load the new watcher fresh.
 USER_ID=$(id -u "$CURRENT_USER")
 
-# 1. Unload any previously running watcher cleanly (also stops its server).
+# 1. Unload any previously running watcher.
 launchctl bootout "gui/$USER_ID/com.imagefilter.server" 2>/dev/null || true
 
-# 2. Clean handoff: make sure no stale server from the old version is left
-#    holding port 10000, so the freshly-loaded watcher starts a clean server.
+# 2. Upgrading from a version before 1.10.0: stop the Python filter server it may
+#    have left running. Only through its own PID file — other Python servers on
+#    this Mac are not ours. (The new watcher also removes the server's virtualenv.)
 PID_FILE="$APP_SUPPORT/gunicorn.pid"
 if [ -f "$PID_FILE" ]; then
     OLD_PID=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [ -n "${OLD_PID:-}" ]; then
-        # gunicorn runs in its own process group — kill the whole group.
+    if [ -n "${OLD_PID:-}" ] && ps -p "$OLD_PID" -o command= 2>/dev/null | grep -q gunicorn; then
+        # gunicorn runs in its own process group — stop the whole group.
         kill -TERM "-$OLD_PID" 2>/dev/null || kill -TERM "$OLD_PID" 2>/dev/null || true
     fi
     rm -f "$PID_FILE"
 fi
-# Belt-and-suspenders: kill any stray gunicorn still serving our app.
-pkill -f 'gunicorn.*app:app' 2>/dev/null || true
 
-# 3. Load the new watcher. RunAtLoad launches it immediately; if Safari is open
-#    right now it starts the server at once, otherwise it waits for Safari.
+# 3. Load the new watcher. RunAtLoad launches it immediately.
 #    bootstrap works from the root context on macOS 10.11+.
 launchctl bootstrap "gui/$USER_ID" "$PLIST" 2>/dev/null || \
     sudo -u "$CURRENT_USER" launchctl load -w "$PLIST" 2>/dev/null || true

@@ -15,7 +15,6 @@
         configLoaded: false,
         isIos: false,            // iPhone/iPad: has an off switch, no password
         enabled: true,           // always true on the Mac
-        engine: 'server',        // 'device' on iOS, 'server' (local Python server) on the Mac
         engineOk: null,          // null until the first check answers
         passwordRequired: false, // true on the Mac
         passwordSet: false,
@@ -366,9 +365,7 @@
         } else if (!state.engineOk) {
             heroState = 'error';
             title = 'Filter not running';
-            detail = state.isIos
-                ? 'The on-device filter couldn’t start. Pictures stay hidden.'
-                : 'The local filter isn’t responding. Pictures stay hidden until it’s back.';
+            detail = 'The filter couldn’t start. Pictures stay hidden until it does.';
         } else {
             heroState = 'on';
             title = 'Filtering is on';
@@ -468,9 +465,7 @@
         el.statFailed.dataset.alert = stats.failed > 0 ? 'true' : 'false';
         el.activityCount.textContent = stats.filtered ? `${stats.filtered} filtered` : '';
 
-        const rows = [['Filter', state.engine === 'device'
-            ? 'On this device' + (stats.delegate ? ` (${stats.delegate})` : '')
-            : 'Local server']];
+        const rows = [['Filter', 'On this device' + (stats.delegate ? ` (${stats.delegate})` : '')]];
         if (stats.processed && stats.avgMs) rows.push(['Speed', `${Math.round(stats.avgMs)} ms per picture`]);
         if (stats.engineLoadMs) rows.push(['Started in', `${stats.engineLoadMs} ms`]);
         const factsKey = JSON.stringify(rows);
@@ -516,7 +511,6 @@
             if (!config) throw new Error('No answer from the background page');
             state.isIos = config.platform === 'ios';
             state.enabled = state.isIos ? config.isEnabled !== false : true;
-            state.engine = config.engine === 'device' ? 'device' : 'server';
             state.passwordRequired = !!config.passwordRequired;
             state.passwordSet = !!config.passwordSet;
             state.excludedSites = Array.isArray(config.excludedSites) ? config.excludedSites : [];
@@ -539,14 +533,13 @@
         }
     }
 
-    // Can the filter run? (On iPhone this loads the on-device engine, so it is skipped while
-    // filtering is switched off.)
+    // Can the filter run? (This loads the engine, so it is skipped while filtering is switched
+    // off on iPhone.)
     async function checkEngine() {
         if (!state.configLoaded || (state.isIos && !state.enabled)) return;
         try {
-            const result = await browser.runtime.sendMessage({ action: 'checkServer' });
+            const result = await browser.runtime.sendMessage({ action: 'checkFilter' });
             state.engineOk = !!(result && result.connected);
-            if (result && result.engine === 'device') state.engine = 'device';
         } catch (error) {
             console.error('Error checking the filter:', error);
             state.engineOk = false;

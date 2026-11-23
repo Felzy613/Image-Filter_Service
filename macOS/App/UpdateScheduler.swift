@@ -2,7 +2,8 @@
 //  UpdateScheduler.swift
 //  Image-Filter_Service
 //
-//  Runs the self-updater inside the always-on LaunchAgent watcher (`--start-server-only`).
+//  Runs the self-updater inside the always-on LaunchAgent watcher (launched with `--start-server-only`,
+//  an argument name kept from when the watcher also ran the filter server).
 //
 //  It is invisible on purpose: no window, no notice, no sound, no Dock icon. The only trace of an
 //  update is that the version number shown in the extension's popup goes up. So:
@@ -21,22 +22,15 @@ final class UpdateScheduler {
     private let logger = Logger(subsystem: "FelzyTech.Image-Filter-Service", category: "UpdateScheduler")
     private let service: UpdateService
     private let safariRunning: () -> Bool
-    private let serverSetupRunning: () -> Bool
-    private let prepareForRestart: () -> Void
 
     private var timer: Timer?
     private var working = false
     private let startedAt = Date()
     private var nextInstallAttempt = Date.distantPast
 
-    init(service: UpdateService,
-         safariRunning: @escaping () -> Bool,
-         serverSetupRunning: @escaping () -> Bool,
-         prepareForRestart: @escaping () -> Void) {
+    init(service: UpdateService, safariRunning: @escaping () -> Bool) {
         self.service = service
         self.safariRunning = safariRunning
-        self.serverSetupRunning = serverSetupRunning
-        self.prepareForRestart = prepareForRestart
     }
 
     func start() {
@@ -80,7 +74,7 @@ final class UpdateScheduler {
     }
 
     private func canInstallNow() -> Bool {
-        UpdateGate.canInstallNow(safariRunning: safariRunning(), serverSetupRunning: serverSetupRunning())
+        UpdateGate.canInstallNow(safariRunning: safariRunning())
     }
 
     private func check() {
@@ -115,11 +109,9 @@ final class UpdateScheduler {
         }
     }
 
-    /// The app on disk is the new version; this process is still the old one. Stop the filter server
-    /// (the new watcher starts a fresh one when Safari opens) and let launchd start the new copy.
+    /// The app on disk is the new version; this process is still the old one. Let launchd start the
+    /// new copy. (Safari opened during the swap? Starting a new watcher is still right.)
     private func restartIntoNewVersion() {
-        // Safari opened during the swap? Starting a new watcher is still right: it picks the server up.
-        prepareForRestart()
         let appURL = Bundle.main.bundleURL
 
         let kick = Process()

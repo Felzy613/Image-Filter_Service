@@ -12,9 +12,6 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Server runtime
-server/models/
-server/gunicorn.pid
 *.log
 
 # Editors

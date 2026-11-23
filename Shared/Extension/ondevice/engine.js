@@ -1,6 +1,7 @@
-// On-device skin filter (iOS extension) — no server.
+// The skin filter — Mac and iPhone/iPad alike, no server.
 //
-// Same model and the same maths as server/app.py, so iPhone and Mac agree:
+// Same model and the same maths as the Python server this replaced (server/app.py, removed in
+// 1.10.0; it is in the git history), which was tuned against test sets — see CLAUDE.md:
 //   detect_skin():        work on a ≤768px copy. Segment the whole image (≤320px) and, for
 //                         anything larger than one tile, overlapping square tiles, so small
 //                         people and wide banners get the model's full 256×256 attention.
@@ -15,7 +16,7 @@
 // canvas instead of inside MediaPipe — same masks (measured), ~15% faster.
 //
 // Modes (option `mode` of analyze / analyzeDataUrl / filterUrl):
-//   'full' (default) — the server's tiling: 5–9 inferences for a typical 512–768px image.
+//   'full' (default) — the full tiling: 5–9 inferences for a typical 512–768px image.
 //                      Use for pictures.
 //   'fast'           — for video frames: the whole-image pass plus square tiles as tall as
 //                      the frame, just enough to cover it (3 inferences for 16:9, 1 for a
@@ -33,7 +34,7 @@
 
 import { ImageSegmenter } from './vision_bundle.js';
 
-// --- detect_skin() tuning, keep in sync with server/app.py ------------------------------
+// --- detect_skin() tuning (the old server's values; see CLAUDE.md before changing) --------
 export const SEG_WORK_MAX = 768;   // resolution tiles are cut from
 const SEG_FULL_MAX = 320;          // the whole-image pass
 const SEG_TILE = 384;              // tile size for large images
@@ -46,17 +47,17 @@ const SKIN_PROB_THRESHOLD = 0.3;   // P(body-skin) + P(face-skin) above this is 
 const SKIN_DILATE_PER_PX = 1 / 384;
 // Images up to this size (longest side of the work copy) never grey pixels whose colour no
 // skin has — tiny avatars/icons are stretched to the model's 256 and it hallucinates a head
-// in a blue letter avatar (see _not_skin_colour in server/app.py). Must stay ≤ SEG_FULL_MAX:
+// in a blue letter avatar (the old server's _not_skin_colour). Must stay ≤ SEG_FULL_MAX:
 // the pixels are read back from the whole-image canvas, which is the work copy only then.
 const SKIN_COLOUR_GATE_MAX = 256;
 const SKIN_RATIO_THRESHOLD = 0.001;
 const MODEL_INPUT = 256;           // selfie_multiclass_256x256
 // Largest picture worth sending to analyzeDataUrl(): bigger ones are shrunk to this first.
-// Smaller ones lose skin on small people (see the tiling notes in server/app.py).
+// Smaller ones lose skin on small people (see the tiling notes in CLAUDE.md).
 export const SEG_MAX = SEG_WORK_MAX;
 const OUTPUT_MAX = 1280;           // load_image() max_dimension
 const SVG_MIN = 300;               // rasterise vector images at least this big
-export const OVERLAY_ALPHA = 1.0;  // server default (SKIN_OVERLAY_ALPHA)
+export const OVERLAY_ALPHA = 1.0;  // 1.0 = fully grey
 const BODY_SKIN = 2;               // confidence masks: 0 background, 1 hair, 2 body-skin,
 const FACE_SKIN = 3;               // 3 face-skin, 4 clothes, 5 others
 
@@ -181,7 +182,7 @@ function fallBackToCpu(failed, error) {
     return segmenterPromise;
 }
 
-// Python's round() (half to even), so sizes match server/app.py exactly.
+// Python's round() (half to even), so sizes match the old server/app.py exactly.
 function pyRound(x) {
     const r = Math.round(x);
     return (r - x === 0.5 && r % 2 !== 0) ? r - 1 : r;
@@ -194,7 +195,7 @@ export function fitWithin(w, h, max) {
 }
 
 // --- Tiling -------------------------------------------------------------------------------
-// server/app.py _tile_origins / _tiles: square { y, x, size } windows covering an h×w
+// The old server/app.py _tile_origins / _tiles: square { y, x, size } windows covering an h×w
 // image, or [] if the whole-image pass is enough.
 function tileOrigins(length, tile, step) {
     const origins = [];
@@ -244,7 +245,7 @@ function scratch(name, w, h) {
     }
     const ctx = canvas.getContext('2d');
     ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';  // closest to the server's INTER_AREA shrink
+    ctx.imageSmoothingQuality = 'high';  // closest to the old server's INTER_AREA shrink
     return { canvas, ctx };
 }
 
@@ -310,7 +311,7 @@ function dilateEllipse(mask, w, h, r) {
 }
 
 // Pixels (1 = can't be skin) whose colour no human skin has, grown by 1px so anti-aliased
-// edges go with them — _not_skin_colour() in server/app.py, same rules on OpenCV's 8-bit HSV
+// edges go with them — _not_skin_colour() in the old server/app.py, same rules on OpenCV's 8-bit HSV
 // (H 0..255 = 0..360°, rounded the same way):
 //   saturated blue/cyan/green/violet (hue 80°–290°, S > 0.55), near-white (S ≤ 0.08, V ≥ 0.92),
 //   vivid bright red/orange/pink (S > 0.8, V > 0.6).

@@ -20,7 +20,6 @@ jobs:
       BUNDLE_ID: FelzyTech.Image-Filter-Service
       # Path to the extension entitlements file (used when re-signing after bundle injection)
       ENTITLEMENTS_EXT: "macOS/Extension/Image-Filter_Service_Extension.entitlements"
-      MODEL_URL: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite"
 
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────────────────
@@ -156,41 +155,11 @@ jobs:
               -maxdepth 1 -name "*.app" -exec cp -r {} "$RUNNER_TEMP/export/" \;
           fi
 
-      # ── 6. Download MediaPipe model ───────────────────────────────────────────
-      - name: Download model
-        run: |
-          mkdir -p server/models
-          echo "Downloading MediaPipe segmentation model…"
-          curl -fsSL "$MODEL_URL" -o server/models/selfie_multiclass_256x256.tflite
-          echo "  $(du -h server/models/selfie_multiclass_256x256.tflite | awk '{print $1}')  model downloaded"
-
-      # ── 7. Inject Python server into .app bundle ──────────────────────────────
-      - name: Inject server into bundle
-        run: |
-          APP_PATH=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name "*.app" | head -1)
-          if [ -z "$APP_PATH" ]; then
-            echo "::error::No .app found in $RUNNER_TEMP/export/"
-            exit 1
-          fi
-          RESOURCES="$APP_PATH/Contents/Resources"
-
-          echo "Bundling Python server into $APP_PATH"
-          cp -r server/          "$RESOURCES/server/"   # includes start_server.py
-          cp    server/requirements.txt "$RESOURCES/requirements.txt"
-
-          # Strip compiled bytecode and runtime-only files that shouldn't ship.
-          find "$RESOURCES/server" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-          find "$RESOURCES/server" -name "*.pyc"       -delete 2>/dev/null || true
-          find "$RESOURCES/server" -name "*.log"       -delete 2>/dev/null || true
-          find "$RESOURCES/server" -name "*.pid"       -delete 2>/dev/null || true
-
-          echo "  Server bundle contents:"
-          ls -lh "$RESOURCES/server/"
-
-      # ── 8. Re-sign after bundle injection ─────────────────────────────────────
-      # Adding files to Contents/Resources after signing breaks the code signature.
-      # This step re-signs the extension (with its entitlements) and then the outer
-      # .app to produce a valid, Gatekeeper-accepted bundle.
+      # ── 6. Re-sign ────────────────────────────────────────────────────────────
+      # Re-signs the extension (with its entitlements) and then the outer .app with the
+      # Hardened Runtime, to produce a valid, Gatekeeper-accepted bundle. (Until 1.10.0 this
+      # also sealed the Python server copied into Contents/Resources; there is none now: the
+      # filter, model included, ships inside the extension, Shared/Extension/ondevice.)
       - name: Re-sign bundle
         run: |
           IDENTITY="${{ steps.signing.outputs.identity }}"
@@ -212,8 +181,7 @@ jobs:
             --entitlements "$ENTITLEMENTS_EXT" \
             "$EXT_PATH"
 
-          # 2. Re-seal the outer .app — locks down Contents/Resources including the
-          #    newly added Python server files.
+          # 2. Re-seal the outer .app.
           codesign --force $RUNTIME_OPT \
             --sign "$CODE_SIGN_ID" \
             "$APP_PATH"
@@ -223,7 +191,7 @@ jobs:
             && echo "Signature verified ✓" \
             || echo "::warning::Signature verification failed (expected for ad-hoc builds on macOS 26+)"
 
-      # ── 9. Build .pkg installer ───────────────────────────────────────────────
+      # ── 7. Build .pkg installer ───────────────────────────────────────────────
       - name: Build .pkg
         id: pkg
         run: |
@@ -275,7 +243,7 @@ jobs:
           echo "pkg_name=$PKG_NAME"   >> "$GITHUB_OUTPUT"
           echo "  $(du -h "$PKG_PATH" | awk '{print $1}')  $PKG_NAME"
 
-      # ── 9b. Signed update files for the in-app updater ───────────────────────
+      # ── 7b. Signed update files for the in-app updater ───────────────────────
       # The installed app updates itself from this release (macOS/App/UpdateService.swift):
       #   <app>.zip   the re-signed app, exactly as inside the .pkg
       #   update.json an Ed25519-signed manifest: version, notes, and the zip's size + SHA-256
@@ -336,7 +304,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Update files ready: $(du -h "$ZIP" | awk '{print $1}')  $(basename "$ZIP")  +  update.json"
 
-      # ── 10. Commit version bump & tag ────────────────────────────────────────
+      # ── 8. Commit version bump & tag ────────────────────────────────────────
       - name: Commit & tag
         run: |
           NEW_VERSION="${{ steps.ver.outputs.new_version }}"
@@ -350,7 +318,7 @@ jobs:
           git tag "v${NEW_VERSION}"
           git push origin main "v${NEW_VERSION}"
 
-      # ── 11. Create GitHub Release ─────────────────────────────────────────────
+      # ── 9. Create GitHub Release ─────────────────────────────────────────────
       - name: Write release notes
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
@@ -373,7 +341,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 12. Cleanup ───────────────────────────────────────────────────────────
+      # ── 10. Cleanup ───────────────────────────────────────────────────────────
       - name: Delete keychain
         if: always() && steps.signing.outputs.keychain != ''
         run: security delete-keychain "${{ steps.signing.outputs.keychain }}" 2>/dev/null || true

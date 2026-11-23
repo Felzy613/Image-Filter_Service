@@ -4,6 +4,17 @@
 //
 //  Created by Felzy730 on 1/26/26.
 //
+//  Two ways to run:
+//   - opened normally: the setup window (ViewController) that sends the user to Safari Settings;
+//   - with `--start-server-only` (the LaunchAgent, macOS/com.imagefilter.server.plist): the
+//     always-on background watcher. It keeps the Safari extension switched on (ExtensionEnforcer)
+//     and installs updates while Safari is closed (UpdateScheduler).
+//
+//  Pictures are filtered inside the Safari extension itself (Shared/Extension/ondevice/engine.js).
+//  Until 1.10.0 this watcher also ran a Python filter server while Safari was open; the argument
+//  name is kept from then so the LaunchAgents already installed keep working. On start it removes
+//  what that server left behind (LegacyServerCleanup).
+//
 
 import Cocoa
 import Foundation
@@ -12,357 +23,119 @@ import Darwin // for kill()
 
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
-    private let logger = Logger(subsystem: "FelzyTech.Image-Filter-Service", category: "ServerStartup")
-    private let serverOnlyLaunchArgument = "--start-server-only"
+    private let logger = Logger(subsystem: "FelzyTech.Image-Filter-Service", category: "Watcher")
+    private let backgroundAgentArgument = "--start-server-only"
 
-    private var isServerOnlyMode = false
-    private var healthCheckTimer: Timer?
-    private var setupInProgress = false
+    private var isBackgroundAgent = false
     private var extensionEnforcer: ExtensionEnforcer?
     private var updateScheduler: UpdateScheduler?
-
-    // MARK: - Path resolution
-    //
-    // Release: server files (incl. start_server.py) are bundled inside Contents/Resources/server/.
-    // Dev:     server files live at the hardcoded repo location; fall through
-    //          to the dev path when the bundle copy is absent.
-
-    private var serverResourcesURL: URL {
-        let bundled = Bundle.main.resourceURL!.appendingPathComponent("server")
-        if FileManager.default.fileExists(atPath: bundled.appendingPathComponent("app.py").path) {
-            return bundled
-        }
-        return URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(
-                "Documents/Software Development/Coding/Random/Image-Filter_Service/server",
-                isDirectory: true)
-    }
-
-    private var startScriptURL: URL {
-        serverResourcesURL.appendingPathComponent("start_server.py")
-    }
-
-    private var appSupportURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first!.appendingPathComponent("Image-Filter-Service", isDirectory: true)
-    }
-
-    private var logsURL: URL {
-        FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)
-            .first!.appendingPathComponent("Logs/Image-Filter-Service", isDirectory: true)
-    }
-
-    // Prefer the installed venv in Application Support; fall back to dev .venv.
-    private var venvURL: URL {
-        let installed = appSupportURL.appendingPathComponent("venv")
-        if FileManager.default.fileExists(
-            atPath: installed.appendingPathComponent("bin/gunicorn").path) {
-            return installed
-        }
-        return URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(
-                "Documents/Software Development/Coding/Random/Image-Filter_Service/.venv",
-                isDirectory: true)
-    }
-
-    // Where venv is created during first-launch setup.
-    private var preferredVenvURL: URL {
-        appSupportURL.appendingPathComponent("venv")
-    }
-
-    private var pidFileURL: URL {
-        appSupportURL.appendingPathComponent("gunicorn.pid")
-    }
 
     // MARK: - App lifecycle
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        isServerOnlyMode = ProcessInfo.processInfo.arguments.contains(serverOnlyLaunchArgument)
-        if isServerOnlyMode {
+        isBackgroundAgent = ProcessInfo.processInfo.arguments.contains(backgroundAgentArgument)
+        if isBackgroundAgent {
             NSApp.setActivationPolicy(.accessory)
         }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        DistributedNotificationCenter.default().addObserver(
-            self,
-            selector: #selector(handleEnsureServer(_:)),
-            name: NSNotification.Name("com.imagefilter.ensureServer"),
-            object: nil)
+        guard isBackgroundAgent else { return }
 
-        if isServerOnlyMode {
-            setupSafariLifecycleWatcher()
-            setupServerHealthCheck()
-            // The always-on watcher also keeps the Safari extension switched on:
-            // Safari is closed while the extension is off (see ExtensionEnforcer).
-            let enforcer = ExtensionEnforcer()
-            enforcer.start()
-            extensionEnforcer = enforcer
-            // Silent self-update: checks GitHub in the background and installs a verified update
-            // only while Safari is closed (see UpdateScheduler).
-            let updater = UpdateScheduler(
-                service: UpdateService.production(),
-                safariRunning: { [weak self] in self?.isSafariRunning() ?? true },
-                serverSetupRunning: { [weak self] in self?.setupInProgress ?? true },
-                prepareForRestart: { [weak self] in self?.stopServer() })
-            updater.start()
-            updateScheduler = updater
-            logger.info("Running in server-only background-agent mode")
-        }
+        setupSafariLifecycleWatcher()
+        // Safari is closed while the extension is off (see ExtensionEnforcer).
+        let enforcer = ExtensionEnforcer()
+        enforcer.start()
+        extensionEnforcer = enforcer
+        // Silent self-update: checks GitHub in the background and installs a verified update only
+        // while Safari is closed (see UpdateScheduler).
+        let updater = UpdateScheduler(
+            service: UpdateService.production(),
+            safariRunning: { [weak self] in self?.isSafariRunning() ?? true })
+        updater.start()
+        updateScheduler = updater
 
-        // Start the server only if Safari is already running. If Safari is closed,
-        // the agent stays idle (negligible footprint) and waits for the
-        // appDidLaunch notification to start the server on demand.
-        if isSafariRunning() {
-            startLocalServerIfNeeded()
-        } else {
-            logger.info("Safari not running at launch — agent idle until Safari opens")
-        }
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        healthCheckTimer?.invalidate()
-        if isServerOnlyMode {
-            stopServer()
-        }
+        let logger = self.logger
+        DispatchQueue.global(qos: .utility).async { LegacyServerCleanup.run(logger: logger) }
+        logger.info("Running as the background watcher")
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return !isServerOnlyMode
-    }
-
-    // MARK: - Distributed notification
-
-    @objc private func handleEnsureServer(_ notification: Notification) {
-        logger.info("Received ensureServer notification from extension")
-        startLocalServerIfNeeded()
+        return !isBackgroundAgent
     }
 
     // MARK: - Safari lifecycle
 
     private func setupSafariLifecycleWatcher() {
-        let nc = NSWorkspace.shared.notificationCenter
-        nc.addObserver(self,
-                       selector: #selector(appDidTerminate(_:)),
-                       name: NSWorkspace.didTerminateApplicationNotification,
-                       object: nil)
-        nc.addObserver(self,
-                       selector: #selector(appDidLaunch(_:)),
-                       name: NSWorkspace.didLaunchApplicationNotification,
-                       object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(appDidTerminate(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification, object: nil)
     }
 
     @objc private func appDidTerminate(_ notification: Notification) {
-        guard let app = safariApp(in: notification) else { return }
-        // Quitting Safari while a Dock web app is still open (or vice versa) must not
-        // stop the server — it stays up until the last Safari-family app is gone.
-        guard !isSafariRunning(excluding: app) else {
-            logger.info("\(app.bundleIdentifier ?? "?", privacy: .public) terminated — other Safari apps still open, keeping server")
-            return
-        }
-        logger.info("Safari terminated — stopping server; agent stays alive watching for next launch")
-        stopServer()
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              SafariFamily.contains(bundleID: app.bundleIdentifier),
+              !isSafariRunning(excluding: app) else { return }
         updateScheduler?.safariDidClose()   // a waiting update installs now, before Safari restarts
     }
 
-    @objc private func appDidLaunch(_ notification: Notification) {
-        guard let app = safariApp(in: notification) else { return }
-        logger.info("\(app.bundleIdentifier ?? "?", privacy: .public) launched — ensuring server is running")
-        startLocalServerIfNeeded()
-    }
-
-    // Safari itself, plus "Add to Dock" web apps: each web app runs as its own
-    // process with bundle ID com.apple.Safari.WebApp.<UUID> and loads the extension,
-    // so it needs the server even when Safari proper is closed.
-    private func isSafariFamily(_ app: NSRunningApplication) -> Bool {
-        SafariFamily.contains(bundleID: app.bundleIdentifier)
-    }
-
-    private func safariApp(in notification: Notification) -> NSRunningApplication? {
-        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey]
-                as? NSRunningApplication, isSafariFamily(app) else { return nil }
-        return app
-    }
-
+    // Safari itself, plus "Add to Dock" web apps: each web app runs as its own process with bundle
+    // ID com.apple.Safari.WebApp.<UUID> and loads the extension.
     private func isSafariRunning(excluding excluded: NSRunningApplication? = nil) -> Bool {
         NSWorkspace.shared.runningApplications.contains {
-            isSafariFamily($0) && !$0.isTerminated
+            SafariFamily.contains(bundleID: $0.bundleIdentifier) && !$0.isTerminated
                 && $0.processIdentifier != excluded?.processIdentifier
         }
     }
+}
 
-    // MARK: - Health check
+// MARK: - What the Python server left behind (versions before 1.10.0)
 
-    private func setupServerHealthCheck() {
-        DispatchQueue.main.async {
-            self.healthCheckTimer = Timer.scheduledTimer(
-                withTimeInterval: 10, repeats: true) { [weak self] _ in
-                // No-ops when Safari is closed (guard inside startLocalServerIfNeeded);
-                // restarts the server within ~10s if it crashes while Safari is open.
-                self?.startLocalServerIfNeeded()
+/// Runs at every watcher start; a no-op once everything is gone. Touches only the server's own
+/// files in this user's Application Support and Caches folders, never the logs, the update state
+/// (`Updates.noindex`) or the opt-in review folder (`review/`, the user's own thumbnails).
+enum LegacyServerCleanup {
+    static func run(logger: Logger) {
+        let fm = FileManager.default
+        let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Image-Filter-Service", isDirectory: true)
+        let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Image-Filter-Service", isDirectory: true)
+
+        // A server the old watcher started and nothing stopped (an install while Safari was open).
+        // Identified by its own PID file and checked to really be gunicorn before it is stopped:
+        // other Python servers on this Mac are none of our business.
+        let pidFile = support.appendingPathComponent("gunicorn.pid")
+        if let raw = try? String(contentsOf: pidFile, encoding: .utf8),
+           let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)), pid > 1 {
+            if commandLine(of: pid)?.contains("gunicorn") == true {
+                kill(-pid, SIGTERM)  // gunicorn runs in its own process group
+                logger.info("Stopped the old filter server (pid \(pid))")
+            }
+        }
+        for url in [pidFile,
+                    support.appendingPathComponent("venv", isDirectory: true),  // ~0.5–1 GB of Python packages
+                    caches.appendingPathComponent("pycache", isDirectory: true)]
+        where fm.fileExists(atPath: url.path) {
+            do {
+                try fm.removeItem(at: url)
+                logger.info("Removed \(url.lastPathComponent, privacy: .public) left by the old filter server")
+            } catch {
+                logger.error("Could not remove \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
     }
 
-    // MARK: - Server start
-
-    private func startLocalServerIfNeeded() {
-        guard !setupInProgress else { return }
-
-        // Foolproof invariant: the heavy server only ever runs while Safari (or a
-        // Safari web app) is open. Every entry point (launch, health check,
-        // ensureServer notification) funnels through here, so this single guard
-        // guarantees the server is never running when Safari is closed.
-        guard isSafariRunning() else {
-            logger.info("Safari and Safari web apps not running — skipping server start")
-            return
-        }
-
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:10000/")!)
-        request.timeoutInterval = 1.0
-
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
-            guard let self else { return }
-
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                self.logger.info("Server already running on port 10000")
-                return
-            }
-            if let error {
-                self.logger.info("Server check: \(error.localizedDescription, privacy: .public)")
-            }
-
-            self.ensureDirectories()
-
-            guard self.isVenvReady() else {
-                self.logger.info("venv not ready — running first-launch setup in background")
-                self.setupInProgress = true
-                self.runVenvSetup { [weak self] success in
-                    guard let self else { return }
-                    self.setupInProgress = false
-                    if success {
-                        self.logger.info("First-launch setup complete — starting server")
-                        self.launchServerBootstrapScript()
-                    } else {
-                        self.logger.error("First-launch setup failed — server cannot start")
-                    }
-                }
-                return
-            }
-
-            self.logger.info("Server not reachable — launching bootstrap script")
-            self.launchServerBootstrapScript()
-        }.resume()
-    }
-
-    private func ensureDirectories() {
-        try? FileManager.default.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: logsURL, withIntermediateDirectories: true)
-    }
-
-    private func isVenvReady() -> Bool {
-        FileManager.default.fileExists(
-            atPath: venvURL.appendingPathComponent("bin/gunicorn").path)
-    }
-
-    private func findPython3() -> URL? {
-        ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
-            .map { URL(fileURLWithPath: $0) }
-            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
-    }
-
-    private func runVenvSetup(completion: @escaping (Bool) -> Void) {
-        guard let python = findPython3() else {
-            logger.error("python3 not found — cannot install server dependencies")
-            completion(false)
-            return
-        }
-
-        let target = preferredVenvURL
-        let reqPath = Bundle.main.resourceURL!.appendingPathComponent("requirements.txt")
-
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-
-            self.logger.info("Creating venv at \(target.path, privacy: .public)")
-            let create = Process()
-            create.executableURL = python
-            create.arguments = ["-m", "venv", target.path]
-            guard (try? create.run()) != nil else { completion(false); return }
-            create.waitUntilExit()
-            guard create.terminationStatus == 0 else {
-                self.logger.error("python -m venv exited \(create.terminationStatus)")
-                completion(false)
-                return
-            }
-
-            self.logger.info("Installing Python dependencies (this may take a few minutes)…")
-            let pip = Process()
-            pip.executableURL = target.appendingPathComponent("bin/pip")
-            pip.arguments = ["install", "--quiet", "-r", reqPath.path]
-            guard (try? pip.run()) != nil else { completion(false); return }
-            pip.waitUntilExit()
-
-            if pip.terminationStatus != 0 {
-                self.logger.error("pip install exited \(pip.terminationStatus)")
-            }
-            completion(pip.terminationStatus == 0)
-        }
-    }
-
-    private func launchServerBootstrapScript() {
-        let script = startScriptURL
-        guard FileManager.default.fileExists(atPath: script.path) else {
-            logger.error("start_server.py not found: \(script.path, privacy: .public)")
-            return
-        }
-        guard let python = findPython3() else {
-            logger.error("python3 not found — cannot launch server")
-            return
-        }
-
-        let process = Process()
-        process.executableURL = python
-        process.arguments = [
-            script.path,
-            "--venv",       venvURL.path,
-            "--server-dir", serverResourcesURL.path,
-            "--log-dir",    logsURL.path,
-            "--pid-file",   pidFileURL.path,
-        ]
-        process.currentDirectoryURL = serverResourcesURL
-        process.terminationHandler = { [weak self] p in
-            self?.logger.info("Bootstrap exited with status \(p.terminationStatus)")
-        }
-
-        do {
-            try process.run()
-            logger.info("Bootstrap script launched")
-        } catch {
-            logger.error("Could not launch bootstrap: \(error.localizedDescription, privacy: .public)")
-        }
-    }
-
-    // MARK: - Server stop
-
-    private func stopServer() {
-        logger.info("Stopping gunicorn server…")
-
-        if let raw = try? String(contentsOf: pidFileURL, encoding: .utf8),
-           let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-           pid > 0 {
-            logger.info("Sending SIGTERM to gunicorn process group (master PID \(pid))")
-            kill(-pid, SIGTERM)
-            try? FileManager.default.removeItem(at: pidFileURL)
-            return
-        }
-
-        logger.info("PID file not found — falling back to pkill")
-        let pkill = Process()
-        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        pkill.arguments = ["-f", "gunicorn.*app:app"]
-        try? pkill.run()
-        pkill.waitUntilExit()
-        logger.info("pkill exited with status \(pkill.terminationStatus)")
+    private static func commandLine(of pid: Int32) -> String? {
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-p", String(pid), "-o", "command="]
+        let out = Pipe()
+        ps.standardOutput = out
+        ps.standardError = FileHandle.nullDevice
+        guard (try? ps.run()) != nil else { return nil }
+        ps.waitUntilExit()
+        guard ps.terminationStatus == 0 else { return nil }
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
     }
 }

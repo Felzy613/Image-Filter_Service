@@ -10,7 +10,7 @@
 //     presentation attributes come back). Two cases:
 //       · Cross-origin video without CORS (or DRM): frames can't be read. Stays unfiltered
 //         until a new source (`emptied`), which is tried again from scratch.
-//       · Checks keep failing (server / engine down, timeouts) for FAIL_GRACE_MS while the
+//       · Checks keep failing (engine not loading, timeouts) for FAIL_GRACE_MS while the
 //         video plays: unfiltered too, but it probes every PROBE_MS and goes back to
 //         filtered frames as soon as a check works.
 //   - Native fullscreen / Picture in Picture / AirPlay would show the raw video, so while a
@@ -27,7 +27,7 @@
     const UNFILTERED = 'data-ifs-unfiltered';  // keep in sync with IFS.ELEMENT_CSS and page-world.js
     // What lockPresentation() changes; saved so an unfiltered video can get the page's values back.
     const PRESENTATION_ATTRS = ['playsinline', 'webkit-playsinline', 'disablepictureinpicture', 'x-webkit-airplay'];
-    // Checks that keep failing (server/engine down, timeouts) this long, while the video plays,
+    // Checks that keep failing (engine not loading, timeouts) this long, while the video plays,
     // release it to play unfiltered; while released, one check every PROBE_MS to see whether
     // filtering works again.
     const FAIL_GRACE_MS = 2000;
@@ -131,8 +131,8 @@
         // This video can't be filtered, so show it as the page made it. Overlay off, hide rule
         // lifted, presentation attributes (inline playback, PiP, AirPlay) back to the page's
         // values. reason 'unreadable': its frames can't be read (cross-origin without CORS, DRM)
-        // — stays so until a new source. reason 'failed': checks keep failing (server or engine
-        // down) — render() keeps probing and resumeFiltering() takes over once a check works.
+        // — stays so until a new source. reason 'failed': checks keep failing (the engine won't
+        // load) — render() keeps probing and resumeFiltering() takes over once a check works.
         releaseVideo(reason) {
             const v = this.video;
             const wasUnfiltered = this.unfiltered;
@@ -372,11 +372,7 @@
                     return;
                 }
                 this.failingSince = 0;
-                if (r.mask) {
-                    IFS.paintMask(wctx, r.mask, size.w, size.h);
-                } else if (r.filteredImageUrl) {
-                    wctx.drawImage(await IFS.loadImage(r.filteredImageUrl, false), 0, 0, size.w, size.h);
-                }
+                if (r.mask) IFS.paintMask(wctx, r.mask, size.w, size.h);
                 // `work` now holds a checked frame: keep it and show it.
                 const shown = this.shown;
                 if (shown.width !== size.w || shown.height !== size.h) {

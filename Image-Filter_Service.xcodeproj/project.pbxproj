@@ -98,9 +98,6 @@
 			exceptions = (
 				7C2F4E10A000000000000021 /* Exceptions for "Extension" folder in "Image-Filter_Service iOS Extension" target */,
 			);
-			explicitFolders = (
-				ondevice,
-			);
 			path = Extension;
 			sourceTree = "<group>";
 		};
@@ -122,6 +119,7 @@
 			explicitFolders = (
 				_locales,
 				images,
+				ondevice,
 			);
 			path = Extension;
 			sourceTree = "<group>";

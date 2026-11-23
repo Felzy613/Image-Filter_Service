@@ -102,9 +102,8 @@ for url in ["http://github.com/x", "https://evilgithub.com/x", "https://github.c
 
 // MARK: - Gate
 
-check(UpdateGate.canInstallNow(safariRunning: false, serverSetupRunning: false), "installs when Safari is closed")
-check(!UpdateGate.canInstallNow(safariRunning: true, serverSetupRunning: false), "waits while Safari is open")
-check(!UpdateGate.canInstallNow(safariRunning: false, serverSetupRunning: true), "waits during first-launch setup")
+check(UpdateGate.canInstallNow(safariRunning: false), "installs when Safari is closed")
+check(!UpdateGate.canInstallNow(safariRunning: true), "waits while Safari is open")
 let now = Date(timeIntervalSince1970: 2_000_000_000)
 check(UpdateGate.checkIsDue(lastAttempt: nil, lastSucceeded: true, now: now), "first check is due")
 check(!UpdateGate.checkIsDue(lastAttempt: now.addingTimeInterval(-3600), lastSucceeded: true, now: now), "not due 1 h after success")
