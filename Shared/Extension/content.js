@@ -176,7 +176,12 @@
     function applyEnabled() {
         const excluded = globalEnabled && isExcludedSite(excludedSites);
         if (excluded && config.isEnabled) log('This website is excluded from filtering');
-        setEnabled(globalEnabled && !excluded);
+        const on = globalEnabled && !excluded;
+        setEnabled(on);
+        // Not filtered: page-world.js puts the browser's own functions back (shadow roots,
+        // video fullscreen), so the page is exactly as Safari made it — nothing for a site's
+        // bot check to trip over. For the rest of this page; a reload starts protected again.
+        if (!on) document.dispatchEvent(new Event('ifs-release-page-world'));
     }
 
     // Function to check if an image should be processed
@@ -385,8 +390,12 @@
     //    canvas, so it isn't worth downloading).
     //  - blob: URLs belong to this page, so they go through the canvas too (the server
     //    can't open them).
+    //  - data: URLs as well. They used to be passed on as they were, but the server only
+    //    reads base64 raster images: an SVG (data:image/svg+xml,<svg… or ;base64) failed on
+    //    every attempt ("Incorrect padding", "cannot identify image file": ~1,100 of them in
+    //    the server log), so the picture — typically a toolbar or menu icon — never appeared,
+    //    with the server running. A data: URL is always readable, so the canvas works.
     async function downloadImageAsBase64(url, displayHint, pageImg) {
-        if (url.startsWith('data:')) return url;
         if (pageImg && pageImg.complete && pageImg.naturalWidth > 0 &&
             (pageImg.currentSrc || pageImg.src) === url) {
             try {

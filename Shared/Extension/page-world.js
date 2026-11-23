@@ -11,10 +11,23 @@
 //     Exception: a video content-video.js can't filter (frames unreadable, or checks
 //     failing) carries data-ifs-unfiltered and plays normally, fullscreen and Picture in
 //     Picture included.
+//
+// Both replace built-in browser functions, which bot checks look for: Cloudflare's managed
+// challenge treats a page whose DOM functions aren't the browser's own as a bot (a single
+// pass-through wrapper around document.createElement was enough to lock people out, KDE bug
+// 487303), and forcing a closed shadow root open is exactly what captcha-solving tools do to
+// Turnstile. So every replaced function is put back, exactly as it was, the moment
+//   - the page adds a Cloudflare challenge script (the "Just a moment..." page, a Turnstile
+//     widget): before that script runs, see watchForChallenges below; or
+//   - content.js says this website is excluded from filtering (event RELEASE_EVENT), so an
+//     excluded site gets a page exactly as the browser made it.
+// background.js doesn't inject this file into the challenge frames themselves
+// (challenges.cloudflare.com and other captcha providers; PAGE_WORLD_EXCLUDE).
 (function () {
     'use strict';
-    if (window.__ifsPageWorld) return;
-    Object.defineProperty(window, '__ifsPageWorld', { value: true });
+    const GUARD = '__ifsPageWorld';
+    if (window[GUARD]) return;
+    Object.defineProperty(window, GUARD, { value: true, configurable: true });
 
     // Keep in sync with IFS.ELEMENT_CSS + IFS.BG_CSS in content-core.js. The first rule is a
     // marker so content-core.js can recognise (and replace) this sheet.
@@ -40,23 +53,50 @@ video:not([data-ifs-unfiltered])${S} { opacity: 0 !important; transition: none !
         return sheet;
     }
 
-    const attachShadow = Element.prototype.attachShadow;
-    if (attachShadow) {
-        Object.defineProperty(Element.prototype, 'attachShadow', {
-            configurable: true,
-            writable: true,
-            value: function (init) {
-                const root = attachShadow.call(this, Object.assign({}, init, { mode: 'open' }));
-                try {
-                    root.adoptedStyleSheets = [...root.adoptedStyleSheets, hideSheet()];
-                } catch (e) { /* very old engine */ }
-                // Not now: custom-element constructors must not add attributes.
-                const host = this;
-                queueMicrotask(() => {
-                    try { host.setAttribute('data-ifs-shadow', ''); } catch (e) {}
-                });
-                return root;
-            }
+    // Every property replaced below, with its original descriptor (or none, if it was inherited),
+    // so release() can put the prototypes back exactly as the browser made them: the same
+    // function objects with the same flags.
+    const replaced = [];
+    function replace(target, name, value) {
+        if (!(name in target)) return;
+        const original = Object.getOwnPropertyDescriptor(target, name) || null;
+        replaced.push({ target, name, original });
+        Object.defineProperty(target, name, original
+            ? { ...original, value }
+            : { value, writable: true, enumerable: true, configurable: true });
+    }
+
+    const RELEASE_EVENT = 'ifs-release-page-world';
+    let challengeWatch = null;
+    let released = false;
+    function release() {
+        if (released) return;
+        released = true;
+        for (const { target, name, original } of replaced.reverse()) {
+            try {
+                if (original) Object.defineProperty(target, name, original);
+                else delete target[name];
+            } catch (e) { /* frozen by the page */ }
+        }
+        replaced.length = 0;
+        if (challengeWatch) challengeWatch.disconnect();
+        document.removeEventListener(RELEASE_EVENT, release, true);
+        try { delete window[GUARD]; } catch (e) {}
+    }
+
+    const nativeAttachShadow = Element.prototype.attachShadow;
+    if (nativeAttachShadow) {
+        replace(Element.prototype, 'attachShadow', function (init) {
+            const root = nativeAttachShadow.call(this, Object.assign({}, init, { mode: 'open' }));
+            try {
+                root.adoptedStyleSheets = [...root.adoptedStyleSheets, hideSheet()];
+            } catch (e) { /* very old engine */ }
+            // Not now: custom-element constructors must not add attributes.
+            const host = this;
+            queueMicrotask(() => {
+                try { host.setAttribute('data-ifs-shadow', ''); } catch (e) {}
+            });
+            return root;
         });
     }
 
@@ -67,29 +107,58 @@ video:not([data-ifs-unfiltered])${S} { opacity: 0 !important; transition: none !
         const unfiltered = el => el.hasAttribute('data-ifs-unfiltered');
         for (const name of ['webkitEnterFullscreen', 'webkitEnterFullScreen']) {
             const original = V[name];
-            if (original) V[name] = function (...args) {
+            if (original) replace(V, name, function (...args) {
                 if (unfiltered(this)) return original.apply(this, args);
-            };
+            });
         }
         const requestPiP = V.requestPictureInPicture;
-        if (requestPiP) V.requestPictureInPicture = function (...args) {
+        if (requestPiP) replace(V, 'requestPictureInPicture', function (...args) {
             return unfiltered(this) ? requestPiP.apply(this, args) : refuse();
-        };
-        if (V.webkitSetPresentationMode) {
-            const setMode = V.webkitSetPresentationMode;
-            V.webkitSetPresentationMode = function (mode) {
-                if (mode === 'inline' || unfiltered(this)) return setMode.call(this, mode);
-            };
-        }
+        });
+        const setMode = V.webkitSetPresentationMode;
+        if (setMode) replace(V, 'webkitSetPresentationMode', function (mode) {
+            if (mode === 'inline' || unfiltered(this)) return setMode.call(this, mode);
+        });
         for (const name of ['requestFullscreen', 'webkitRequestFullscreen', 'webkitRequestFullScreen']) {
             const original = Element.prototype[name];
             if (!original) continue;
-            Element.prototype[name] = function (...args) {
+            replace(Element.prototype, name, function (...args) {
                 if (this instanceof HTMLVideoElement && !unfiltered(this)) {
                     return name === 'requestFullscreen' ? refuse() : undefined;
                 }
                 return original.apply(this, args);
-            };
+            });
         }
+    }
+
+    // --- Putting the browser's functions back --------------------------------------------
+    // content.js (isolated world) dispatches this on the document once it knows the site is
+    // excluded. A page could dispatch it too; all it would gain is its own native fullscreen
+    // and closed shadow roots — the content scripts still filter everything they can reach.
+    document.addEventListener(RELEASE_EVENT, release, true);
+
+    // Cloudflare challenge code: the "Just a moment..." page (…/cdn-cgi/challenge-platform/h/…
+    // orchestrate script) and Turnstile (challenges.cloudflare.com/turnstile/…). Scripts are seen
+    // here when they are added to the document — for one the parser adds, the observer runs at the
+    // microtask checkpoint the parser performs before running it; one a script adds is fetched
+    // first — so the functions are back before Cloudflare's code runs. Only direct additions are
+    // looked at (that is how these scripts arrive), which keeps this cheap on busy pages.
+    // Not included: Cloudflare's background bot detection (…/challenge-platform/scripts/jsd/),
+    // which runs in a separate blank frame on ordinary pages of many sites; releasing there
+    // would give up shadow-root and fullscreen protection on a large part of the web, and there
+    // is no evidence it is affected. Change CHALLENGE_SRC if that turns out to be wrong.
+    const CHALLENGE_SRC = /\/cdn-cgi\/challenge-platform\/h\/|\/\/challenges\.cloudflare\.com\/turnstile\//;
+    function isChallengeScript(node) {
+        return node.nodeType === 1 && node.localName === 'script' && CHALLENGE_SRC.test(node.src || '');
+    }
+    if (window.MutationObserver) {
+        challengeWatch = new MutationObserver(records => {
+            for (const r of records) {
+                for (const n of r.addedNodes) {
+                    if (isChallengeScript(n)) return release();
+                }
+            }
+        });
+        challengeWatch.observe(document, { childList: true, subtree: true });
     }
 })();

@@ -12,8 +12,7 @@
     const config = {
         serverUrl: DEFAULT_SERVER_URL,
         enableLogging: true,
-        timeout: 8000,  // 8 seconds — local server should never need more
-        retryAttempts: 2,
+        timeout: 8000,  // downloading an image here (fetchAsJpegDataUrl)
         isEnabled: true,
         // 'server' (POST to serverUrl) or 'device' (filter in this extension, no server).
         // 'device' only exists on iOS, where it is the default; resolved in loadConfig().
@@ -106,10 +105,18 @@
         }
     }
 
+    // At most one request per NATIVE_START_GAP_MS. Every failing image used to send one, and the
+    // app answers each by checking the port and, if that check is slow, launching the bootstrap
+    // script (host.log: ~170 "Server started successfully"; once, a second gunicorn fighting the
+    // first for the port).
+    const NATIVE_START_GAP_MS = 5000;
+    let lastNativeStart = -Infinity;
     async function requestNativeServerStartup() {
         if (!await canAutoStartLocalServer()) {
             return;
         }
+        if (Date.now() - lastNativeStart < NATIVE_START_GAP_MS) return;
+        lastNativeStart = Date.now();
         if (typeof browser.runtime.sendNativeMessage !== 'function') {
             log('Native messaging is unavailable in this context');
             return;
@@ -389,36 +396,121 @@
         } catch { /* failed load: nothing to release */ }
     }, 15000);
 
-    // Core HTTP request with retry. Does not touch the cache or inflight map.
-    async function _fetchFromServer(imageUrl, imageData, dimensions, retryCount) {
+    // --- Talking to the server (macOS) ------------------------------------------------
+    // A page must not break because the server is starting, restarting or busy (found
+    // 2026-11-23: a toolbar of icons stayed blank; see CLAUDE.md, "Server down or slow"):
+    //  - Not reachable (it starts a few seconds after Safari opens, and is restarted within ~10 s
+    //    after a crash): a request waits for it, up to SERVER_START_WAIT_MS, instead of failing,
+    //    and the moment it answers every tab is told (serverOnline) to retry what failed.
+    //  - Busy (a page-load burst, or CPU contention: it runs at nice 10): at most
+    //    SERVER_MAX_INFLIGHT requests are sent at a time, the rest wait here, and a request's
+    //    timeout only starts once it has been sent. A request that timed out is not sent again:
+    //    the server is alive, and resending only lengthens its queue. (Before, everything was sent
+    //    at once, the 8 s timeout ran while a request sat in gunicorn's backlog, and each failure
+    //    was sent twice more — a slow server got three times the work.)
+    // Every failure still fails closed: the picture stays hidden and is retried.
+    const SERVER_MAX_INFLIGHT = 6;          // gunicorn has 8 threads: 2 stay free for health checks
+    const SERVER_REQUEST_TIMEOUT_MS = 10000;
+    const SERVER_START_WAIT_MS = 10000;
+
+    let serverInflight = 0;
+    const serverQueue = [];
+    function withServerSlot(task) {
+        return new Promise((resolve, reject) => {
+            const run = () => {
+                serverInflight++;
+                Promise.resolve().then(task).then(resolve, reject).finally(() => {
+                    serverInflight--;
+                    const next = serverQueue.shift();
+                    if (next) next();
+                });
+            };
+            if (serverInflight < SERVER_MAX_INFLIGHT) run();
+            else serverQueue.push(run);
+        });
+    }
+
+    // One POST. Resolves to the server's JSON; rejects with error.kind 'unreachable' (nothing
+    // answered: not running), 'timeout' (running, no answer in time) or 'http' (bad reply).
+    async function postToServer(payload) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
+        const fail = (kind, message) => Object.assign(new Error(message), { kind });
         try {
-            const payload = { imageUrl, imageData };
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), config.timeout);
-
-            const response = await fetch(config.serverUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-
-            if (!response.ok) {
-                throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+            let response;
+            try {
+                response = await fetch(config.serverUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal
+                });
+            } catch (error) {
+                throw controller.signal.aborted
+                    ? fail('timeout', 'The filter server did not answer in time')
+                    : fail('unreachable', 'The filter server is not reachable');
             }
+            if (!response.ok) throw fail('http', `Server returned ${response.status}: ${response.statusText}`);
+            try {
+                return await response.json();
+            } catch (error) {
+                throw controller.signal.aborted
+                    ? fail('timeout', 'The filter server did not answer in time')
+                    : fail('http', 'Unreadable answer from the filter server');
+            }
+        } finally {
+            clearTimeout(timer);
+        }
+    }
 
-            const result = await response.json();
-            if (!result.success) throw new Error(result.error || 'Unknown server error');
+    function failClosed(error) {
+        stats.failed++;
+        // success:true so the page isn't broken; fallback:true so content.js keeps it hidden.
+        return { success: true, filteredImageUrl: null, filtered: false, error, fallback: true };
+    }
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Check pixels (a JPEG data URL) on the server. Does not touch the cache or inflight map.
+    // live: a video frame — never waits for a server that is starting (a later frame will do).
+    // serverDownloads: no pixels, the server downloads imageUrl itself (see _filterOnServer).
+    async function _fetchFromServer(imageUrl, imageData, { live = false, serverDownloads = false } = {}) {
+        // The server used to receive requests with nothing in them and fail them ("No image
+        // data or URL provided"); the picture then stayed hidden for good.
+        if (!imageData && !(serverDownloads && /^https?:/i.test(imageUrl || ''))) {
+            return failClosed('No pixels to check');
+        }
+        const payload = { imageUrl, imageData };
+        const deadline = Date.now() + SERVER_START_WAIT_MS;
+        for (let attempt = 1; ; attempt++) {
+            if (serverDown && (live || !await waitForServer(deadline - Date.now()))) {
+                return failClosed('The filter server is not running');
+            }
+            let result;
+            try {
+                result = await withServerSlot(() => postToServer(payload));
+            } catch (error) {
+                log('Error sending image to server:', error.message);
+                if (error.kind === 'unreachable') {
+                    noteServerDown();
+                    if (!live && attempt < 3) {
+                        if (!serverDown) await sleep(500);  // not ours to start: brief pause
+                        continue;                           // waits for it (top of the loop)
+                    }
+                } else if (error.kind === 'http' && attempt < 2) {
+                    await sleep(500);
+                    continue;
+                }
+                return failClosed(error.message);
+            }
+            noteServerUp();
+            if (!result || !result.success) return failClosed((result && result.error) || 'Unknown server error');
             if (result.error) {
                 // The server is up but couldn't check this image (e.g. a format it can't
                 // decode). It answers success:true so pages don't break — but the image was
-                // NOT checked, so it must stay hidden: fail closed. No retry / server start
-                // here; content.js re-queues failed images with backoff.
+                // NOT checked, so it must stay hidden: fail closed. content.js re-queues it.
                 log('Server could not check image:', result.error);
-                stats.failed++;
-                return { success: true, filteredImageUrl: null, filtered: false,
-                         error: result.error, fallback: true };
+                return failClosed(result.error);
             }
 
             stats.processed++;
@@ -431,29 +523,6 @@
                 filteredImageUrl: result.filtered ? result.filteredImageUrl : null,
                 filtered: result.filtered,
                 containsSkin: result.containsSkin
-            };
-
-        } catch (error) {
-            log('Error sending image to server:', error.message);
-
-            if (retryCount === 0) {
-                await requestNativeServerStartup();
-            }
-
-            if (retryCount < config.retryAttempts) {
-                const delay = retryCount === 0 ? 200 : 500; // tight retries for local server
-                log(`Retrying in ${delay}ms (attempt ${retryCount + 1}/${config.retryAttempts})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                return _fetchFromServer(imageUrl, imageData, dimensions, retryCount + 1);
-            }
-
-            stats.failed++;
-            return {
-                success: true,  // avoid breaking the page on total failure
-                filteredImageUrl: null,
-                filtered: false,
-                error: error.message,
-                fallback: true
             };
         }
     }
@@ -469,8 +538,17 @@
         const timeoutId = setTimeout(() => controller.abort(), config.timeout);
         let bitmap;
         try {
-            const response = await fetch(url, { credentials: 'include', signal: controller.signal });
-            if (!response.ok) throw new Error(`Image download failed: ${response.status}`);
+            let response;
+            try {
+                response = await fetch(url, { credentials: 'include', signal: controller.signal });
+            } catch (error) {
+                // No answer at all (not allowed on that host, offline, DNS) — unless it was our timeout.
+                if (!controller.signal.aborted) error.unreachable = true;
+                throw error;
+            }
+            if (!response.ok) {
+                throw Object.assign(new Error(`Image download failed: ${response.status}`), { httpStatus: response.status });
+            }
             bitmap = await decodeImageBlob(await response.blob());
         } finally {
             clearTimeout(timeoutId);
@@ -524,15 +602,27 @@
         }
     }
 
-    async function _filterOnServer(imageUrl, imageData, maxDim, dimensions) {
-        if (!imageData && /^https?:/i.test(imageUrl || '')) {
+    // content.js sends pixels whenever it can read them; otherwise this page downloads and
+    // encodes the picture (http(s), and data: URLs content.js couldn't decode).
+    // The server downloads the URL itself only if this page couldn't reach the host at all (no
+    // answer: e.g. the extension isn't allowed on that host). Not when the host answered with an
+    // error (403, 404, 5xx): the server, without the browser's cookies, would only get the same
+    // refusal — and its requests come from python-requests on this Mac's own IP address while
+    // claiming to be Safari, which is what bot protection looks for: Cloudflare sites refused
+    // them (403 from makerworld.com, ivelt.com in the server log), and bot traffic from an
+    // address makes those sites challenge the real browser on it more often.
+    async function _filterOnServer(imageUrl, imageData, maxDim) {
+        let serverDownloads = false;
+        if (!imageData && /^(https?|data):/i.test(imageUrl || '')) {
             try {
                 imageData = await fetchAsJpegDataUrl(imageUrl, maxDim);
             } catch (error) {
-                log('Background fetch failed, server will download the image:', error.message);
+                serverDownloads = /^https?:/i.test(imageUrl) && !!error.unreachable;
+                log(serverDownloads ? 'Image host not reachable from here, server will download it:'
+                                    : 'Image could not be read; it stays hidden:', error.message);
             }
         }
-        return _fetchFromServer(imageUrl, imageData, dimensions, 0);
+        return _fetchFromServer(imageUrl, imageData, { serverDownloads });
     }
 
     // Public entry point: checks cache, deduplicates in-flight requests, then delegates to _fetchFromServer.
@@ -565,7 +655,7 @@
 
         const promise = config.engine === 'device'
             ? _filterOnDevice(imageUrl, imageData)
-            : _filterOnServer(imageUrl, imageData, maxDim, dimensions);
+            : _filterOnServer(imageUrl, imageData, maxDim);
 
         if (cacheKey) {
             inflightRequests.set(cacheKey, promise);
@@ -598,7 +688,7 @@
                 if (!config.isEnabled) return { success: false, error: 'Service is disabled' };
                 return config.engine === 'device'
                     ? _filterOnDevice(null, request.imageData, { countStats: false, mode: request.mode })
-                    : _fetchFromServer(null, request.imageData, null, 0);
+                    : _fetchFromServer(null, request.imageData, { live: !!request.live });
             }).then(sendResponse, error => sendResponse({ success: false, error: error && error.message }));
             return true;
         }
@@ -751,9 +841,14 @@
     
     // Initialize
     // --- Server health tracking ---
+    // serverDown: the last contact found nothing listening. While it is set, requests wait for
+    // the server (waitForServer) and it is polled every 500 ms; the first answer releases them
+    // and tells every tab to retry what failed (serverOnline). Set by a failed request as well
+    // as by the 5 s health check, so a page that is loading doesn't wait for the next check.
 
-    let serverWasDown = false;
+    let serverDown = false;
     let recoveryPoll = null;
+    let serverUpWaiters = [];
 
     // Health polling exists to auto-start the server on this Mac: only for the server
     // engine, pointed at localhost, and never on iOS (nothing there can start it).
@@ -762,16 +857,18 @@
             && isLocalServerUrl(config.serverUrl);
     }
 
+    // 'up', 'down' (nothing listening) or 'busy' (connected, but no answer within 2 s: it is
+    // running, just loaded — a busy server must not be treated as a dead one).
     async function pingServer() {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 2000);
         try {
             const r = await fetch(serverRootUrl(), { method: 'GET', signal: controller.signal });
-            clearTimeout(timeoutId);
-            return r.ok;
+            return r.ok ? 'up' : 'down';
         } catch {
+            return controller.signal.aborted ? 'busy' : 'down';
+        } finally {
             clearTimeout(timeoutId);
-            return false;
         }
     }
 
@@ -782,22 +879,66 @@
         });
     }
 
+    // Resolves true once the server answers, false after `ms` (or at once if ms <= 0).
+    function waitForServer(ms) {
+        if (!serverDown) return Promise.resolve(true);
+        if (ms <= 0) return Promise.resolve(false);
+        return new Promise(resolve => {
+            const waiter = up => {
+                clearTimeout(timer);
+                resolve(up);
+            };
+            const timer = setTimeout(() => {
+                serverUpWaiters = serverUpWaiters.filter(w => w !== waiter);
+                resolve(false);
+            }, ms);
+            serverUpWaiters.push(waiter);
+        });
+    }
+
+    function noteServerDown() {
+        if (!shouldPollLocalServer()) return;  // not on this Mac: nothing to start or wait for
+        if (!serverDown) {
+            serverDown = true;
+            log('Server not reachable — asking the app to start it');
+        }
+        requestNativeServerStartup();  // throttled
+        startRecoveryPolling();
+    }
+
+    function noteServerUp() {
+        if (recoveryPoll) {
+            clearInterval(recoveryPoll);
+            recoveryPoll = null;
+        }
+        if (!serverDown) return;
+        serverDown = false;
+        const waiters = serverUpWaiters;
+        serverUpWaiters = [];
+        for (const w of waiters) w(true);
+        log('Server back online — notifying content scripts');
+        notifyContentScriptsServerOnline();
+    }
+
     function startRecoveryPolling() {
         if (recoveryPoll) return;
         log('Server down — fast-polling every 500ms until online');
+        let polling = false;
         recoveryPoll = setInterval(async () => {
             if (!shouldPollLocalServer()) {
                 // Pointed elsewhere meanwhile (remote server / on-device) — stop polling.
                 clearInterval(recoveryPoll);
                 recoveryPoll = null;
+                noteServerUp();
                 return;
             }
-            if (await pingServer()) {
-                clearInterval(recoveryPoll);
-                recoveryPoll = null;
-                serverWasDown = false;
-                log('Server back online — notifying content scripts');
-                notifyContentScriptsServerOnline();
+            if (polling) return;  // a ping can take 2 s: never pile them up
+            polling = true;
+            try {
+                if (await pingServer() !== 'down') noteServerUp();
+                else requestNativeServerStartup();  // still down: ask again (throttled)
+            } finally {
+                polling = false;
             }
         }, 500);
     }
@@ -809,13 +950,7 @@
     setInterval(async () => {
         if (!shouldPollLocalServer()) return;
         if (recoveryPoll) return; // fast poll already running
-        if (!await pingServer()) {
-            if (!serverWasDown) {
-                serverWasDown = true;
-                await requestNativeServerStartup();
-            }
-            startRecoveryPolling();
-        }
+        if (await pingServer() === 'down') noteServerDown();
     }, 5000);
 
     // Initialize: request startup, then immediately begin fast polling if server is down.
@@ -832,32 +967,66 @@
         }
         if (!shouldPollLocalServer()) return;
         await requestNativeServerStartup();
-        if (!await pingServer()) {
-            serverWasDown = true;
-            startRecoveryPolling();
-        }
+        if (await pingServer() === 'down') noteServerDown();
     });
 
 
 
     // page-world.js must run in the page's own JavaScript world (shadow roots, video
     // presentation). Safari ignores "world" in manifest content_scripts but supports it here.
-    // Registrations persist; register once.
+    // Registrations persist, so an existing one is kept only if it matches this definition
+    // (an older version registered without the exclusions below).
+    //
+    // Not in bot-check frames: page-world.js replaces built-in DOM functions, which those
+    // checks treat as a bot (see page-world.js), and these frames have no shadow-DOM pictures
+    // or videos to protect. Their pictures (a captcha's photo grid) are still filtered by the
+    // content scripts. Cloudflare's frame has no pictures at all, so the content scripts skip it
+    // too (manifest "exclude_matches").
+    const PAGE_WORLD_EXCLUDE = [
+        '*://challenges.cloudflare.com/*',
+        '*://*.hcaptcha.com/*',
+        '*://www.google.com/recaptcha/*',
+        '*://www.recaptcha.net/recaptcha/*',
+        '*://recaptcha.google.com/recaptcha/*',
+        '*://*.arkoselabs.com/*',
+        '*://*.funcaptcha.com/*',
+        '*://geo.captcha-delivery.com/*'
+    ];
+    const PAGE_WORLD_SCRIPT = {
+        id: 'ifs-page-world',
+        js: ['page-world.js'],
+        matches: ['<all_urls>'],
+        excludeMatches: PAGE_WORLD_EXCLUDE,
+        runAt: 'document_start',
+        allFrames: true,
+        world: 'MAIN'
+    };
+    // Bump when PAGE_WORLD_SCRIPT changes: the stored number says which definition is registered
+    // (a registration's fields aren't reliably reported back), so it is replaced exactly once.
+    const PAGE_WORLD_VERSION = 2;
     async function registerPageWorldScript() {
+        let existing = null;
+        let registeredVersion = 0;
         try {
-            const existing = await browser.scripting.getRegisteredContentScripts({ ids: ['ifs-page-world'] });
-            if (existing && existing.length) return;
+            [existing] = await browser.scripting.getRegisteredContentScripts({ ids: [PAGE_WORLD_SCRIPT.id] });
+            registeredVersion = (await browser.storage.local.get('pageWorldVersion')).pageWorldVersion || 0;
         } catch (e) { /* fall through and try to register */ }
+        if (existing && registeredVersion === PAGE_WORLD_VERSION) return;
         try {
-            await browser.scripting.registerContentScripts([{
-                id: 'ifs-page-world',
-                js: ['page-world.js'],
-                matches: ['<all_urls>'],
-                runAt: 'document_start',
-                allFrames: true,
-                world: 'MAIN'
-            }]);
-            log('Registered page-world script');
+            if (existing) {
+                await browser.scripting.unregisterContentScripts({ ids: [PAGE_WORLD_SCRIPT.id] });
+            }
+            try {
+                await browser.scripting.registerContentScripts([PAGE_WORLD_SCRIPT]);
+            } catch (error) {
+                // Never leave pages without it: fall back to the old definition (no exclusions).
+                log('Page-world registration with exclusions failed, registering without:', error && error.message);
+                const { excludeMatches, ...plain } = PAGE_WORLD_SCRIPT;
+                await browser.scripting.registerContentScripts([plain]);
+                return;  // not recorded as current: tried again on the next start
+            }
+            await browser.storage.local.set({ pageWorldVersion: PAGE_WORLD_VERSION });
+            log(existing ? 'Updated page-world script registration' : 'Registered page-world script');
         } catch (error) {
             log('Could not register page-world script:', error && error.message);
         }

@@ -340,6 +340,13 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
             pictureCache.clear();
             for (const m of modules) if (m.onEngineChange) m.onEngineChange();
         }
+        // The server is reachable again (background.js): everything that failed while it was
+        // down or overloaded is checked again now. Without this, inline SVGs, CSS pictures and
+        // <object>/<embed> waited out their own back-off (up to 60 s) — a toolbar of icons stayed
+        // blank for up to a minute after the server was back. (content.js handles <img>.)
+        if (request.action === 'serverOnline' && IFS.enabled) {
+            for (const m of modules) if (m.retryNow) m.retryNow();
+        }
     });
 
     const SEG_MAX = 768;           // on-device input: tiled detection needs the pixels (ondevice/engine.js)
@@ -561,7 +568,10 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     // (server) or { failed }. Throws if the canvas is tainted (cross-origin video).
     // mode (on-device engine): 'full' (default, the server's tiling) or 'fast' (video frames:
     // whole frame + frame-height tiles, ~3 passes for 16:9 — see ondevice/engine.js).
+    // 'fast' also tells the background this is a live frame: while the server is starting it
+    // fails at once instead of waiting for it (a later frame will do; content-video.js decides).
     IFS.checkCanvas = async function (canvas, { mode } = {}) {
+        if (!canvas.width || !canvas.height) return { failed: true };  // nothing drawn yet
         await IFS.engineReady;
         const device = IFS.engine === 'device';
         const size = IFS.fit(canvas.width, canvas.height, device ? SEG_MAX : Math.max(SERVER_MIN, Math.min(canvas.width, OUTPUT_MAX)));
@@ -569,7 +579,7 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
             ? canvas : IFS.drawToCanvas(canvas, size.w, size.h);
         const imageData = small.toDataURL('image/jpeg', device ? 0.8 : 0.85);
         if (small !== canvas) IFS.releaseCanvas(small);
-        const response = await send({ action: 'analyzeFrame', imageData, mode });
+        const response = await send({ action: 'analyzeFrame', imageData, mode, live: mode === 'fast' });
         if (!isOk(response)) return { failed: true };
         if (response.filtered === false) return { clean: true };
         if (response.mask) return { mask: response.mask };

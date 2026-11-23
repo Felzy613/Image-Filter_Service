@@ -128,6 +128,22 @@
         'clip-rule', 'mask', 'filter', 'mix-blend-mode', 'paint-order', 'marker-start', 'marker-mid', 'marker-end'];
     const OWN_ATTRS = [IFS.STATE, APPROVED, ORIGINAL, 'data-ifs-pid', 'data-ifs-bg', 'data-ifs-probe'];
 
+    // The copy is parsed as XML when drawn, and an attribute name XML doesn't allow makes the
+    // whole picture fail to load — every time, so the icon never appeared. HTML allows such
+    // names, and frameworks put them on SVG icons: Alpine/Vue `:class`, `@click`, `x-on:click`,
+    // `v-bind:…` (a prefix without a declared namespace). They never affect how it looks, so drop
+    // them. Kept: plain names, and xlink:/xml:/xmlns: attributes (real namespaces).
+    const XML_NAME = /^[A-Za-z_][\w.-]*$/;
+    const XML_NAMESPACES = new Set([XLINK_NS, 'http://www.w3.org/XML/1998/namespace', 'http://www.w3.org/2000/xmlns/']);
+    function dropNonXmlAttributes(el) {
+        for (let i = el.attributes.length - 1; i >= 0; i--) {
+            const a = el.attributes[i];
+            if (XML_NAMESPACES.has(a.namespaceURI) && XML_NAME.test(a.localName)) continue;
+            if (!a.namespaceURI && XML_NAME.test(a.name)) continue;
+            el.removeAttributeNode(a);
+        }
+    }
+
     // Copy `source` with each element's computed paint properties inlined, so the picture
     // looks as it does on the page (page CSS doesn't apply inside an SVG drawn as an image).
     function styledCopy(source, skipDisplayOnRoot) {
@@ -137,6 +153,7 @@
         const inline = src.length <= 3000;  // huge charts: skip (slow); geometry still rasterises
         for (let i = 0; i < src.length; i++) {
             for (const a of OWN_ATTRS) dst[i].removeAttribute(a);
+            dropNonXmlAttributes(dst[i]);
             if (!inline) continue;
             const cs = getComputedStyle(src[i]);
             let decl = '';
@@ -392,6 +409,12 @@
                 if (abs(rawUrl(el, 'svgimage') || '') !== el.getAttribute(APPROVED)) recheckSingle(el);
             }
             for (const root of IFS.allRoots()) scanTree(root);
+        },
+
+        // The server is back (content-core.js): retry everything that failed, now.
+        retryNow() {
+            for (const [el, r] of retry) retry.set(el, { at: 0, delay: r.delay });
+            this.tick();
         },
 
         onEngineChange() {

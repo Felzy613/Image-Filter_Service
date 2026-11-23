@@ -462,6 +462,12 @@
             if (due.length) process(due);
         },
 
+        // The server is back (content-core.js): retry everything that failed, now.
+        retryNow() {
+            for (const [el, r] of retry) retry.set(el, { at: 0, delay: r.delay });
+            this.tick();
+        },
+
         setEnabled(on) {
             if (on) {
                 scheduleSweep(0);

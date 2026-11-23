@@ -29,6 +29,9 @@
             "matches": [
                 "<all_urls>"
             ],
+            "exclude_matches": [
+                "*://challenges.cloudflare.com/*"
+            ],
             "run_at": "document_start",
             "all_frames": true
         }

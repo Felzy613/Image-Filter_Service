@@ -16,7 +16,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
-from urllib.parse import urlparse
+from urllib.parse import unquote_to_bytes, urlparse
 
 import certifi
 import cv2
@@ -437,11 +437,28 @@ def load_image(image_data: Optional[str], image_url: Optional[str]) -> Image.Ima
 
 
 def _decode_data_url(data: str) -> bytes:
+    """The bytes of a data: URL (base64 or percent-encoded), or of bare base64.
+
+    The extension sends JPEGs it encoded itself. Before 2026-11-23 it also passed a page's own
+    data: URLs on unchanged, and every SVG or non-base64 one failed here ("Incorrect padding",
+    "list index out of range", "cannot identify image file") — on every retry, so the picture
+    never appeared. The extension now rasterises them; this keeps the errors clear if one slips by.
+    """
     if data.startswith("data:"):
-        data = data.split(",", 1)[1]
+        header, comma, body = data[5:].partition(",")
+        if not comma:
+            raise ValueError("Malformed data URL (no comma)")
+        if "svg" in header.lower():
+            raise ValueError("SVG data URL: the extension must send it rasterised")
+        if len(body) > MAX_IMAGE_BYTES * 4 // 3 + 4:
+            raise ValueError("Image payload too large")
+        if ";base64" not in header.lower():
+            return unquote_to_bytes(body)
+        data = body
     if len(data) > MAX_IMAGE_BYTES * 4 // 3 + 4:
         raise ValueError("Image payload too large")
-    return base64.b64decode(data)
+    data = "".join(data.split())  # line breaks inside base64 are allowed
+    return base64.b64decode(data + "=" * (-len(data) % 4))
 
 
 def _open_bytes(img_bytes: bytes) -> Image.Image:
