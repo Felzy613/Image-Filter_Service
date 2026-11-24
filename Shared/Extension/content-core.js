@@ -247,10 +247,41 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     // Our own elements (video overlays) are ignored by every module.
     IFS.isOwnElement = el => el.nodeType === 1 && el.hasAttribute('data-ifs-overlay');
 
-    const observer = new MutationObserver(records => {
-        if (!IFS.enabled) return;
-        IFS.touch();
-        IFS.ensureDocumentStyles();
+    // --- Feedback loops with the page ----------------------------------------------------
+    // Our observers answer the page's DOM changes with small changes of their own (a probe
+    // attribute, a pinned style, a state attribute). A page script that answers each of those
+    // with another change makes the two observers call each other forever inside one microtask
+    // checkpoint, and the page freezes. Found 2026-11-23 on claude.ai: its message box is a
+    // ProseMirror editor, which rebuilds a paragraph whenever an attribute on it changes, and
+    // content-backgrounds.js probed each rebuilt paragraph at once (100% CPU, page dead). Editors
+    // are now left alone (IFS.inEditor below). The general safety net: when our observers run
+    // LOOP_LIMIT times before the event loop gets to run a task, the frame is "calming" for
+    // CALM_MS (twice as long each time it happens again soon after): the per-element work on
+    // NEW elements (probing, checking) is then done from a task, a little later, instead of
+    // synchronously. New elements are hidden by the stylesheets until checked, so that only
+    // delays showing them. What hides something at once (an <img> whose src changed, an inline
+    // !important background, new content in a checked SVG, a video's new source) is never delayed.
+    const LOOP_LIMIT = 25;
+    const CALM_MS = 3000;
+    const CALM_MAX_MS = 60000;
+    IFS.CALM_GAP_MS = 500;
+    let chainDepth = 0, chainResetQueued = false, calmUntil = 0, calmMs = CALM_MS;
+    // Every observer callback of ours calls this first.
+    IFS.noteObserverCall = function (name) {
+        if (!chainResetQueued) {
+            chainResetQueued = true;
+            setTimeout(() => { chainDepth = 0; chainResetQueued = false; }, 0);  // runs once the checkpoint is over
+        }
+        const now = performance.now();
+        if (++chainDepth > LOOP_LIMIT && now >= calmUntil) {
+            calmMs = calmUntil && now - calmUntil < 10000 ? Math.min(calmMs * 2, CALM_MAX_MS) : CALM_MS;
+            calmUntil = now + calmMs;
+            IFS.log(`A page script answers every change we make (${name}): checking new elements a little later for ${calmMs / 1000} s`);
+        }
+    };
+    IFS.calming = () => performance.now() < calmUntil;
+
+    function handleRecords(records) {
         const added = [];
         const attrs = [];
         const shadowRecords = [];
@@ -258,7 +289,7 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
             if (r.target.getRootNode() !== document) shadowRecords.push(r);
             if (r.type === 'childList') {
                 for (const n of r.addedNodes) {
-                    if (n.nodeType === 1 && !IFS.isOwnElement(n)) added.push(n);
+                    if (n.nodeType === 1 && n.isConnected && !IFS.isOwnElement(n)) added.push(n);
                 }
             } else {
                 attrs.push(r);
@@ -272,8 +303,22 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
         // <img> inside shadow roots: content.js observes only the document itself.
         if (shadowRecords.length && IFS.img) IFS.img.handleMutations(shadowRecords);
         for (const m of modules) if (m.onMutations) m.onMutations(added, attrs);
+    }
+
+    const observer = new MutationObserver(records => {
+        if (!IFS.enabled) return;
+        IFS.noteObserverCall('core');
+        IFS.touch();
+        IFS.ensureDocumentStyles();
+        handleRecords(records);
     });
     observer.observe(document, OBSERVE);
+
+    // Rich-text editors own the DOM inside them: ProseMirror (claude.ai, many others) and
+    // CodeMirror rebuild an element when an attribute on it changes. Modules that mark or probe
+    // elements leave everything inside one alone (see the loop note above).
+    const EDITABLE = '[contenteditable]:not([contenteditable="false" i])';
+    IFS.inEditor = el => document.designMode === 'on' || !!(el.closest && el.closest(EDITABLE));
 
     // The whole-document walk for shadow roots is a safety net (added nodes are walked as they arrive,
     // and page-world.js tags every shadow host, which the observer reports): it runs when nodes were

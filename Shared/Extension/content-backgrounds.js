@@ -74,6 +74,11 @@
 
     function isCandidate(el) {
         if (el.nodeType !== 1 || SKIP_TAGS.has(el.tagName) || IFS.isOwnElement(el)) return false;
+        // Inside a rich-text editor every probe (an attribute set and removed) makes the editor
+        // rebuild the element, and the rebuilt one is probed again: claude.ai froze (see
+        // IFS.noteObserverCall). Never probed or pinned there: CSS pictures inside an editor stay
+        // suppressed (not shown). An inline `!important` one is still covered (onMutations).
+        if (IFS.inEditor && IFS.inEditor(el)) return false;
         // Elements inside an <svg> have no CSS boxes; the outermost <svg> does.
         if (el.namespaceURI === SVG_NS) {
             if (el.tagName.toLowerCase() !== 'svg') return false;
@@ -328,6 +333,20 @@
         if (IFS.enabled && els.length) processBatch(els);
     }
 
+    const pendingAdded = new Set();
+    let addedTimer = null;
+    function queueAddedLater(els) {
+        for (const el of els) pendingAdded.add(el);
+        if (!addedTimer) {
+            addedTimer = setTimeout(() => {
+                addedTimer = null;
+                const due = [...pendingAdded].filter(el => el.isConnected);
+                pendingAdded.clear();
+                if (IFS.enabled && due.length) processBatch(due);
+            }, IFS.CALM_GAP_MS || 500);
+        }
+    }
+
     // A class/id change on an element with many descendants: re-read just that subtree (chunked), not
     // the whole page, and not more than once a second per element (toggling a class on a big container
     // is usually UI state). Descendants stay suppressed meanwhile, so this is latency only.
@@ -415,14 +434,25 @@
             const attrEls = [];    // existing nodes whose class/id/style changed
             const seen = new Set();
             const add = (list, el) => {
-                if (!seen.has(el) && isCandidate(el)) {
+                if (seen.has(el)) return;
+                if (isCandidate(el)) {
                     seen.add(el);
                     list.push(el);
+                } else if (el.nodeType === 1 && el.style && el.style.length && IFS.inEditor && IFS.inEditor(el)) {
+                    seen.add(el);
+                    coverInlineImportant(el);  // in an editor: not probed, but never left showing
                 }
             };
             let sheetsChanged = false;
             for (const n of added) {
                 if (n.tagName === 'STYLE' || (n.tagName === 'LINK' && /stylesheet/i.test(n.rel))) sheetsChanged = true;
+                if (IFS.inEditor && IFS.inEditor(n)) {
+                    // Not probed (isCandidate), but a page's inline `!important` picture beats the
+                    // suppression rule, so it is still covered. Only writes when there is one.
+                    coverInlineImportant(n);
+                    for (const d of n.querySelectorAll('[style]')) coverInlineImportant(d);
+                    continue;
+                }
                 add(addedEls, n);
                 for (const d of n.querySelectorAll('*')) add(addedEls, d);
             }
@@ -447,7 +477,12 @@
                 }
             }
             for (const el of addedEls) coverInlineImportant(el);
-            if (addedEls.length) processBatch(addedEls);
+            if (addedEls.length) {
+                // In a feedback loop with the page (IFS.calming): probe from a task, a little later
+                // (they are suppressed until then), so our probes stop feeding the loop.
+                if (IFS.calming && IFS.calming()) queueAddedLater(addedEls);
+                else processBatch(addedEls);
+            }
             if (attrEls.length) queueAttr(attrEls);
             if (sheetsChanged) scheduleSweep();
         },

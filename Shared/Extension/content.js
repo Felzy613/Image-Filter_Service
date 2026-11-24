@@ -607,13 +607,17 @@
     function handleImgMutations(mutations) {
         mutations.forEach((mutation) => {
             if (mutation.type === 'attributes' && !IMG_ATTRIBUTES.includes(mutation.attributeName)) return;
-            // Check added nodes
+            // Check added nodes. While the page is in a feedback loop with us (content-core.js,
+            // IFS.calming) new images are left to the 250 ms scan: they are hidden until checked.
+            const calming = globalThis.__ifs && globalThis.__ifs.calming && globalThis.__ifs.calming();
             mutation.addedNodes.forEach((node) => {
-                if (node.nodeType === 1) { // Element node
+                if (node.nodeType === 1 && node.isConnected) { // Element node, still in the page
                     if (node.tagName === 'SOURCE') {
                         // New <source> in a <picture> could change what its <img> shows.
                         const img = pictureImgOf(node);
                         if (img && img.hasAttribute(config.processedAttribute)) recheck(img);
+                    } else if (calming) {
+                        // (the scan picks new images up)
                     } else if (node.tagName === 'IMG') {
                         if (shouldProcessImage(node)) {
                             processImage(node);
@@ -652,6 +656,8 @@
     }
 
     const observer = new MutationObserver((mutations) => {
+        // Counts towards the feedback-loop check (content-core.js, IFS.noteObserverCall).
+        if (globalThis.__ifs && globalThis.__ifs.noteObserverCall) globalThis.__ifs.noteObserverCall('img');
         // A page script removed our hiding stylesheet: put it back before the next paint.
         ensureHideStyle();
         handleImgMutations(mutations);
