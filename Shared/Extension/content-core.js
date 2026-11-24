@@ -329,11 +329,32 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     };
     IFS.isCurrent = (el, round, key = '') => (rounds.get(el)?.get(key) || 0) === round;
 
+    // --- The extension API ---------------------------------------------------------------
+    // Safari (seen on 27.2) sometimes runs our content scripts in a tab whose web view it never
+    // connected to the extension — WebKit logs "web view … is not configured with a
+    // WKWebExtensionController" — and there `browser` doesn't exist (other extensions lose theirs
+    // too; WebKit bug 294769 was the same symptom). Nothing can be checked in such a tab, for any
+    // page loaded in it (a reload doesn't help), so every picture stays hidden. The background page
+    // finds these tabs (they don't answer its ping, below) and reopens them as new tabs, which
+    // Safari connects properly. Here we only keep working without the API: hidden, failing every
+    // check, instead of throwing half-way through setting up.
+    const api = typeof browser !== 'undefined' && browser && browser.runtime ? browser : null;
+    IFS.api = api;
+    if (!api) {
+        IFS.log('Safari started this tab without the extension API (a Safari bug): pictures stay ' +
+                'hidden here until the extension reopens the tab.');
+    }
+
     // --- Engine --------------------------------------------------------------------------
     // Pictures are checked by the engine in the background page (ondevice/engine.js). Asking for
     // the config also wakes that page, which starts loading the engine before our images arrive.
-    IFS.engineReady = browser.runtime.sendMessage({ action: 'getConfig' }).catch(() => {});
-    browser.runtime.onMessage.addListener(request => {
+    IFS.engineReady = api ? api.runtime.sendMessage({ action: 'getConfig' }).catch(() => {}) : Promise.resolve();
+    if (api) api.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        // The background page checks that a tab's content scripts can reach it (see above).
+        if (request.action === 'ifsPing') {
+            sendResponse({ ok: true, top: window.top === window });
+            return;
+        }
         // The engine works again after failing to load (background.js): everything that failed
         // meanwhile is checked again now. Without this, inline SVGs, CSS pictures and
         // <object>/<embed> waited out their own back-off (up to 60 s) — a toolbar of icons stayed
@@ -502,9 +523,12 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
             new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Check timed out')), ms); })
         ]).finally(() => clearTimeout(timer));
     }
+    IFS.withTimeout = withTimeout;
+    IFS.CHECK_TIMEOUT_MS = CHECK_TIMEOUT_MS;
 
     function send(message) {
-        return withTimeout(browser.runtime.sendMessage(message));
+        if (!api) return Promise.reject(new Error('No extension API in this tab'));
+        return withTimeout(api.runtime.sendMessage(message));
     }
     const isOk = r => r && r.success && !r.error && !r.fallback;
 

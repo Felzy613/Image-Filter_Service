@@ -261,9 +261,23 @@
     // and nothing large crosses to the background.
     const SEG_MAX = 768;  // keep in sync with ondevice/engine.js (tiled detection needs the pixels)
 
+    // Missing when Safari started this tab without the extension API (see content-core.js): every
+    // check then fails and the pictures stay hidden until the background page reopens the tab.
+    const api = typeof browser !== 'undefined' && browser && browser.runtime ? browser : null;
+
     // Asking for the config wakes the background page, which starts loading the engine before
     // our images arrive.
-    const engineReady = browser.runtime.sendMessage({ action: 'getConfig' }).catch(() => {});
+    const engineReady = api ? api.runtime.sendMessage({ action: 'getConfig' }).catch(() => {}) : Promise.resolve();
+
+    // A check that never gets an answer (the background page restarted mid-request, an image
+    // download that stalls) must not keep its slot: MAX_CONCURRENT stuck checks used to stop every
+    // other picture on the page from being checked. It fails instead, and is retried.
+    const CHECK_TIMEOUT_MS = 20000;
+    function withTimeout(promise) {
+        const ifs = globalThis.__ifs;
+        if (ifs && ifs.withTimeout) return ifs.withTimeout(promise, CHECK_TIMEOUT_MS);
+        return promise;
+    }
 
     // Load with CORS so the pixels are readable; rejects if the site doesn't allow it
     // (the background page then downloads the image itself).
@@ -348,7 +362,8 @@
                 log('Pixels not readable here; background will download the image:', error.message);
             }
         }
-        const response = await browser.runtime.sendMessage({
+        if (!api) throw new Error('No extension API in this tab');
+        const response = await api.runtime.sendMessage({
             action: 'filterImage',
             imageUrl: src,
             imageData: imageData
@@ -413,7 +428,7 @@
             // clientWidth/clientHeight are the CSS layout pixels (pre-DPR).
             const displayHint = { w: img.clientWidth || 0, h: img.clientHeight || 0 };
 
-            ({ response, image } = await requestOnDevice(src, img));
+            ({ response, image } = await withTimeout(requestOnDevice(src, img)));
 
             // The page changed this image while we were checking it: a newer round owns it.
             if (!isCurrent(img, round)) return;
@@ -717,7 +732,7 @@
     setTimeout(retryFailedImages, retryDelay);
 
     // Listen for messages from background script
-    browser.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (api) api.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (request.action === 'updateConfig') {
             // Respond to enable/disable toggle from the popup (iOS only; the background
             // always reports `true` on the Mac)
@@ -739,7 +754,7 @@
     // the correct mode — especially important if the user previously disabled the
     // extension and then navigates to a new page.
     // Same for excluded websites: on one, everything is revealed as soon as this resolves.
-    browser.storage.local.get(['isEnabled', 'excludedSites', 'platform']).then(result => {
+    if (api) api.storage.local.get(['isEnabled', 'excludedSites', 'platform']).then(result => {
         // Only the iPhone/iPad extension has an off switch. On the Mac a stored "off" (left
         // over from before it was removed) must not count — and an unknown platform fails
         // closed the same way (background.js writes `platform` each time it loads).
