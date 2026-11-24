@@ -658,8 +658,13 @@
         if (!isCheckablePage(tab.url) || tab.status === 'loading') return;
         tabsBeingChecked.add(tab.id);
         try {
-            const origin = new URL(tab.url).origin;
-            const allowed = await browser.permissions.contains({ origins: [origin + '/*'] }).catch(() => true);
+            // A match pattern has no port (Safari throws on "http://127.0.0.1:8766/*"). If the
+            // answer can't be had, carry on: the reopen limit below still stops a loop.
+            const page = new URL(tab.url);
+            let allowed = true;
+            try {
+                allowed = await browser.permissions.contains({ origins: [`${page.protocol}//${page.hostname}/*`] });
+            } catch { /* unknown: assume allowed (host_permissions is <all_urls>) */ }
             if (!allowed) return;
             if (tab.windowId !== undefined && browser.windows && browser.windows.get) {
                 const win = await browser.windows.get(tab.windowId).catch(() => null);
