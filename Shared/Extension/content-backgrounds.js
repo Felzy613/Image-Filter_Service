@@ -191,6 +191,7 @@
             if (st.getPropertyPriority(prop) !== 'important') continue;
             const value = st.getPropertyValue(prop);
             if (!value || value === 'none') continue;
+            if (IFS.isOwnRaster && IFS.isOwnRaster(el, prop, value)) continue;  // an inline <svg>'s checked raster (content-elements.js)
             const rec = records.get(el);
             const pin = rec && rec.pins[prop];
             if (pin && value === pin.value) continue;   // our own approved pin

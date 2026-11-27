@@ -232,13 +232,21 @@
     // markup hash -> Promise<{clean}|{raster}|{failed}>; bounded, rasters freed when unused.
     const svgCache = IFS.boundedCache(200, pending => pending.then(r => r && r.raster));
     const ownSvgStyle = new WeakMap();
+    const ownRaster = new WeakMap();  // svg -> its inline background-image while it shows our raster
     const RASTER_PROPS = ['background-image', 'background-size', 'background-repeat', 'background-position'];
+
+    // The raster is an inline `!important` background, which content-backgrounds.js would
+    // otherwise take for a page's unchecked picture and cover with `none`: the icon went blank,
+    // and that style change started a re-check every 200 ms (found 2026-11-27, together with
+    // the blank copy in serializeAsShown below).
+    IFS.isOwnRaster = (el, prop, value) => prop === 'background-image' && ownRaster.get(el) === value;
 
     function showRaster(svg, raster) {
         svg.style.setProperty('background-image', `url("${raster}")`, 'important');
         svg.style.setProperty('background-size', '100% 100%', 'important');
         svg.style.setProperty('background-repeat', 'no-repeat', 'important');
         svg.style.setProperty('background-position', 'center', 'important');
+        ownRaster.set(svg, svg.style.getPropertyValue('background-image'));
         ownSvgStyle.set(svg, svg.getAttribute('style'));
         svg.setAttribute(STATE, 'raster');
     }
@@ -246,6 +254,23 @@
         if (!ownSvgStyle.has(svg)) return;
         for (const p of RASTER_PROPS) svg.style.removeProperty(p);
         ownSvgStyle.delete(svg);
+        ownRaster.delete(svg);
+    }
+
+    // Serialise the SVG as the page draws it. While it shows a raster, our own rule
+    // (content-core.js) hides its children, so a copy taken then came out blank, the blank
+    // picture checked clean, and the unfiltered SVG was shown: a re-check of a greyed SVG put
+    // the original on screen until the next re-check (found 2026-11-27: an icon on a block page
+    // alternated between the two every 200 ms). Lift the state for this synchronous read only:
+    // no paint can happen before it is put back.
+    function serializeAsShown(svg, rect) {
+        if (svg.getAttribute(STATE) !== 'raster') return serializeSvg(svg, rect);
+        svg.setAttribute(STATE, 'processing');
+        try {
+            return serializeSvg(svg, rect);
+        } finally {
+            svg.setAttribute(STATE, 'raster');
+        }
     }
     function showLive(svg) {
         clearRaster(svg);
@@ -281,7 +306,7 @@
         }
         let markup;
         try {
-            markup = serializeSvg(svg, rect);
+            markup = serializeAsShown(svg, rect);
         } catch (error) {
             IFS.log('Could not read inline SVG:', error && error.message);
             svg.setAttribute(STATE, 'failed');
