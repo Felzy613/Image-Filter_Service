@@ -376,30 +376,24 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
 
     // --- The extension API ---------------------------------------------------------------
     // Safari (seen on 27.2) sometimes runs our content scripts in a tab whose web view it never
-    // connected to the extension — WebKit logs "web view … is not configured with a
-    // WKWebExtensionController" — and there `browser` doesn't exist (other extensions lose theirs
-    // too; WebKit bug 294769 was the same symptom). Nothing can be checked in such a tab, for any
-    // page loaded in it (a reload doesn't help), so every picture stays hidden. The background page
-    // finds these tabs (they don't answer its ping, below) and reopens them as new tabs, which
-    // Safari connects properly. Here we only keep working without the API: hidden, failing every
-    // check, instead of throwing half-way through setting up.
+    // connected to the extension (WebKit logs "web view ... is not configured with a
+    // WKWebExtensionController"), and there `browser` doesn't exist; other extensions lose theirs
+    // too. Nothing can be checked in such a tab, for any page loaded in it (a reload doesn't help),
+    // so its pictures stay hidden; opening the page in a new tab works. Here we only keep working
+    // without the API: hidden, failing every check, instead of throwing half-way through setting
+    // up. (1.11.1-1.11.3 reopened such tabs automatically. Removed: see CLAUDE.md.)
     const api = typeof browser !== 'undefined' && browser && browser.runtime ? browser : null;
     IFS.api = api;
     if (!api) {
         IFS.log('Safari started this tab without the extension API (a Safari bug): pictures stay ' +
-                'hidden here until the extension reopens the tab.');
+                'hidden here. Open the page in a new tab.');
     }
 
     // --- Engine --------------------------------------------------------------------------
     // Pictures are checked by the engine in the background page (ondevice/engine.js). Asking for
     // the config also wakes that page, which starts loading the engine before our images arrive.
     IFS.engineReady = api ? api.runtime.sendMessage({ action: 'getConfig' }).catch(() => {}) : Promise.resolve();
-    if (api) api.runtime.onMessage.addListener((request, sender, sendResponse) => {
-        // The background page checks that a tab's content scripts can reach it (see above).
-        if (request.action === 'ifsPing') {
-            sendResponse({ ok: true, top: window.top === window });
-            return;
-        }
+    if (api) api.runtime.onMessage.addListener(request => {
         // The engine works again after failing to load (background.js): everything that failed
         // meanwhile is checked again now. Without this, inline SVGs, CSS pictures and
         // <object>/<embed> waited out their own back-off (up to 60 s) — a toolbar of icons stayed

@@ -176,7 +176,7 @@
         config.platform = await getPlatformOs();
         try {
             const result = await browser.storage.local.get([
-                'isEnabled', 'excludedSites', 'serverUrl', 'engine',
+                'isEnabled', 'excludedSites', 'serverUrl', 'engine', 'tabCheckLog', 'reopenedTabs',
                 'passwordRecord', 'passwordFailures', 'passwordLockedUntil'
             ]);
             // On the Mac a stored "off" (from before the switch was removed) is ignored and put
@@ -188,10 +188,11 @@
             } else if (result.isEnabled !== undefined) {
                 config.isEnabled = result.isEnabled;
             }
-            // Left over from the server days: nothing reads them any more.
-            if (result.serverUrl !== undefined || result.engine !== undefined) {
-                browser.storage.local.remove(['serverUrl', 'engine']).catch(() => {});
-            }
+            // Left over from the server days, and from the tab reopening in 1.11.1-1.11.3 (which
+            // noted the sites it touched): nothing reads them any more.
+            const leftovers = ['serverUrl', 'engine', 'tabCheckLog', 'reopenedTabs']
+                .filter(key => result[key] !== undefined);
+            if (leftovers.length) browser.storage.local.remove(leftovers).catch(() => {});
             browser.storage.local.set({ platform: config.platform }).catch(() => {});
             config.excludedSites = normalizeSiteList(result.excludedSites);
             passwordRecord = result.passwordRecord && result.passwordRecord.hash ? result.passwordRecord : null;
@@ -589,144 +590,6 @@
         }
     }
     registerPageWorldScript();
-
-    // --- Tabs Safari didn't connect to the extension (macOS) --------------------------
-    // Safari 27.2 sometimes gives a tab a web view it never connects to the extension (WebKit logs
-    // "web view … returned by webViewForWebExtensionContext: is not configured with a
-    // WKWebExtensionController"; seen right after Safari starts and right after an iCloud Tabs /
-    // Tab Groups sync). Our content scripts still run in that tab, but without the `browser` API,
-    // so nothing in it can be checked and every picture stays hidden — for every page loaded in
-    // that tab: a reload doesn't help (measured). Other extensions break there too.
-    //
-    // Such a tab doesn't answer a ping. It is reopened as a new tab in the same place (same
-    // window, position, pinned/active state), which Safari sets up properly. Only http(s) pages
-    // the extension may run on, not while loading, at most REOPEN_LIMIT times per page in
-    // REOPEN_WINDOW_MS (a page whose scripts never answer for another reason must not loop).
-    // What's lost: that tab's back/forward history and anything typed into it.
-    const PING_TIMEOUT_MS = 3000;
-    const REOPEN_LIMIT = 2;
-    const REOPEN_WINDOW_MS = 10 * 60 * 1000;
-    const TAB_CHECK_LOG_MAX = 40;
-    const tabsBeingChecked = new Set();
-
-    // 'ok' (our scripts answered), 'none' (nothing there: the message was refused) or 'timeout'.
-    function pingTab(tabId) {
-        return new Promise(resolve => {
-            const timer = setTimeout(() => resolve({ result: 'timeout' }), PING_TIMEOUT_MS);
-            browser.tabs.sendMessage(tabId, { action: 'ifsPing' }).then(
-                reply => { clearTimeout(timer); resolve({ result: reply && reply.ok ? 'ok' : 'none' }); },
-                error => { clearTimeout(timer); resolve({ result: 'none', error: String(error && error.message || error) }); });
-        });
-    }
-
-    // A few recent outcomes, for diagnosing on the Mac (storage key tabCheckLog: host only).
-    async function recordTabCheck(entry) {
-        try {
-            const { tabCheckLog = [] } = await browser.storage.local.get('tabCheckLog');
-            tabCheckLog.push({ t: Date.now(), ...entry });
-            await browser.storage.local.set({ tabCheckLog: tabCheckLog.slice(-TAB_CHECK_LOG_MAX) });
-        } catch { /* diagnostics only */ }
-    }
-
-    function isCheckablePage(url) {
-        let u;
-        try { u = new URL(url); } catch { return false; }
-        if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
-        if (u.hostname === 'challenges.cloudflare.com') return false;  // manifest exclude_matches
-        if (/\.pdf$/i.test(u.pathname)) return false;                   // no content scripts in Safari's PDF view
-        return true;
-    }
-
-    // Reopens are counted per page (storage, so a restarted background page still knows).
-    async function mayReopen(key) {
-        const now = Date.now();
-        let { reopenedTabs = {} } = await browser.storage.local.get('reopenedTabs').catch(() => ({}));
-        for (const k of Object.keys(reopenedTabs)) {
-            reopenedTabs[k] = (reopenedTabs[k] || []).filter(t => now - t < REOPEN_WINDOW_MS);
-            if (!reopenedTabs[k].length) delete reopenedTabs[k];
-        }
-        const times = reopenedTabs[key] || [];
-        if (times.length >= REOPEN_LIMIT) return false;
-        reopenedTabs[key] = [...times, now];
-        await browser.storage.local.set({ reopenedTabs }).catch(() => {});
-        return true;
-    }
-
-    async function checkTab(tab) {
-        if (!tab || tab.id === undefined || tabsBeingChecked.has(tab.id)) return;
-        if (config.platform === 'ios' || !config.isEnabled) return;
-        if (!isCheckablePage(tab.url) || tab.status === 'loading') return;
-        tabsBeingChecked.add(tab.id);
-        try {
-            // A match pattern has no port (Safari throws on "http://127.0.0.1:8766/*"). If the
-            // answer can't be had, carry on: the reopen limit below still stops a loop.
-            const page = new URL(tab.url);
-            let allowed = true;
-            try {
-                allowed = await browser.permissions.contains({ origins: [`${page.protocol}//${page.hostname}/*`] });
-            } catch { /* unknown: assume allowed (host_permissions is <all_urls>) */ }
-            if (!allowed) return;
-            if (tab.windowId !== undefined && browser.windows && browser.windows.get) {
-                const win = await browser.windows.get(tab.windowId).catch(() => null);
-                if (win && win.type && win.type !== 'normal') return;
-            }
-            let ping = await pingTab(tab.id);
-            if (ping.result === 'timeout') recordTabCheck({ host: new URL(tab.url).host, result: 'timeout' });
-            if (ping.result !== 'none') return;
-            // Once more after a moment: the page may have been between documents.
-            await new Promise(resolve => setTimeout(resolve, 1500));
-            const now = await browser.tabs.get(tab.id).catch(() => null);
-            if (!now || now.url !== tab.url || now.status === 'loading') return;
-            ping = await pingTab(tab.id);
-            const host = new URL(tab.url).host;
-            if (ping.result !== 'none') {
-                recordTabCheck({ host, result: 'recovered-' + ping.result });
-                return;
-            }
-            const u = new URL(tab.url);
-            if (!(await mayReopen(u.host + u.pathname))) {
-                log('Tab not connected to the extension, already reopened recently — leaving it:', host);
-                recordTabCheck({ host, result: 'gave-up', error: ping.error });
-                return;
-            }
-            log('Tab not connected to the extension (Safari bug) — reopening it:', host);
-            const created = await browser.tabs.create({
-                windowId: now.windowId,
-                index: now.index,
-                url: now.url,
-                active: !!now.active,
-                ...(now.pinned ? { pinned: true } : {})
-            });
-            await browser.tabs.remove(now.id);
-            recordTabCheck({ host, result: 'reopened', error: ping.error, newTab: created && created.id });
-        } catch (error) {
-            log('Tab check failed:', error && error.message);
-        } finally {
-            tabsBeingChecked.delete(tab.id);
-        }
-    }
-
-    async function checkActiveTabs() {
-        try {
-            for (const tab of await browser.tabs.query({ active: true })) checkTab(tab);
-        } catch { /* no tabs API */ }
-    }
-
-    if (browser.tabs && browser.tabs.onActivated) {
-        browser.tabs.onActivated.addListener(({ tabId }) => {
-            setTimeout(() => browser.tabs.get(tabId).then(checkTab, () => {}), 500);
-        });
-    }
-    if (browser.tabs && browser.tabs.onUpdated) {
-        browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-            if (changeInfo.status === 'complete') setTimeout(() => checkTab(tab), 500);
-        });
-    }
-    // At start (Safari just launched, or this page was woken) and while awake.
-    configReady.then(() => {
-        for (const delay of [2000, 10000, 30000]) setTimeout(checkActiveTabs, delay);
-    });
-    setInterval(checkActiveTabs, 30000);
 
     // Periodic cache cleanup
     setInterval(() => {

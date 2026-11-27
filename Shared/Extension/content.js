@@ -262,7 +262,7 @@
     const SEG_MAX = 768;  // keep in sync with ondevice/engine.js (tiled detection needs the pixels)
 
     // Missing when Safari started this tab without the extension API (see content-core.js): every
-    // check then fails and the pictures stay hidden until the background page reopens the tab.
+    // check then fails and the pictures stay hidden; a new tab works.
     const api = typeof browser !== 'undefined' && browser && browser.runtime ? browser : null;
 
     // Asking for the config wakes the background page, which starts loading the engine before
