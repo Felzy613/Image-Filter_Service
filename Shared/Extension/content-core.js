@@ -476,19 +476,55 @@ video:not([data-ifs-unfiltered])${SPEC} { opacity: 0 !important; transition: non
     // synchronous JPEG encode on the page's main thread and a 0.3–0.6 MB string copied around
     // (inline styles, attribute reads) — enough to stall long pages.
     // The canvas is released once encoded.
-    IFS.canvasToUrl = function (canvas, type = 'image/jpeg', quality = 0.9) {
+    IFS.canvasToUrl = async function (canvas, type = 'image/jpeg', quality = 0.9) {
+        const useBlob = await blobImagesAllowed();
         return new Promise(resolve => {
             const done = url => {
                 IFS.releaseCanvas(canvas);
                 resolve(url);
             };
+            const sync = () => done(canvas.toDataURL(type, quality));
             try {
-                canvas.toBlob(blob => done(blob ? URL.createObjectURL(blob) : canvas.toDataURL(type, quality)), type, quality);
+                canvas.toBlob(blob => {
+                    if (!blob) return sync();
+                    if (useBlob) return done(URL.createObjectURL(blob));
+                    const reader = new FileReader();
+                    reader.onload = () => done(reader.result);
+                    reader.onerror = sync;
+                    reader.readAsDataURL(blob);
+                }, type, quality);
             } catch {
-                done(canvas.toDataURL(type, quality));
+                sync();
             }
         });
     };
+
+    // A page's Content Security Policy applies to the pictures we put in it too: where img-src
+    // lacks blob:, Safari refuses ours, and a filtered picture never appeared (found 2026-11-27
+    // on a DNS block page). Asked once per page with a 1×1 picture, before the first one we hand
+    // out; where blob: is refused, they are data: URLs instead.
+    let blobAllowed = null;
+    function blobImagesAllowed() {
+        if (!blobAllowed) {
+            blobAllowed = new Promise(resolve => {
+                const probe = document.createElement('canvas');
+                probe.width = probe.height = 1;
+                probe.toBlob(blob => {
+                    if (!blob) return resolve(false);
+                    const url = URL.createObjectURL(blob);
+                    const image = new Image();
+                    const answer = ok => {
+                        URL.revokeObjectURL(url);
+                        resolve(ok);
+                    };
+                    image.onload = () => answer(true);
+                    image.onerror = () => answer(false);
+                    image.src = url;
+                });
+            });
+        }
+        return blobAllowed;
+    }
 
     // Is a URL we handed out still shown anywhere? (Before revoking a blob: URL.)
     IFS.urlInUse = function (url) {
